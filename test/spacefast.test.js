@@ -170,7 +170,7 @@ test("exchanges a claimed anonymous key and continues on the same space", async 
   // Whoever claimed the Space may have made it public: the retry then stops before uploading.
   accessAfterClaim = [{ id: "grt_all", subject: { audience: "public" }, capabilities: ["page.view"], resources: { include: ["/**"], exclude: [] }, target: { kind: "live" } }];
   publishAttempts = 0;
-  await assert.rejects(publishSession({ fetchImpl, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key" }), /This Space is public/);
+  await assert.rejects(publishSession({ fetchImpl, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key" }), { message: /This Space is public/, stage: "claim_exchange" });
   assert.equal(publishAttempts, 1, "only the first, refused attempt reached the publish endpoint");
 });
 

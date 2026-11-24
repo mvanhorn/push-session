@@ -13,9 +13,15 @@ const PATTERNS = [
   // Authorization headers: the scheme stays, the credential goes. In a header any length is a
   // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
   /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi,
+  // Schemes whose credential is several fields: everything to the end of the line goes.
+  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\])[^\n]+/gi,
   /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g,
-  // Environment-style NAME_KEY=value assignments; the name stays readable.
-  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\?["']?)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
+  // Environment-style NAME_KEY=value assignments; the name stays readable. A quoted value is masked
+  // up to its closing quote, spaces and escaped quotes included, so none of it is left behind.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=(["']))(?!\[redacted\])(?:\\[\s\S]|(?!\2)[^\\]){8,}(?=\2)/g,
+  // The same inside a JSON string, where the quotes themselves are escaped.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:(?!\\\2)[\s\S]){8,}(?=\\\2)/g,
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
   // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
   // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
   /(["'][A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd)[A-Za-z0-9_-]*\\?["']\s*:\s*\\?["'])(?!\[redacted\])(?=[^\s"'\\]*[\d_+/=.-])[^\s"'\\]{8,}(?=\\?["'])/gi,
@@ -45,6 +51,7 @@ function archiveSecrets(content) {
 
 const CREDENTIAL_FIELD =/api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd/i;
 const AUTHORIZATION_FIELD = /^(?:proxy-)?authorization$/i;
+const ALREADY_MASKED = /^\s*(?:(?:Bearer|Basic|Digest|Negotiate|NTLM)\s+)?\[redacted\]\s*$/i;
 const CREDENTIAL_VALUE = /^(?=\S*[\d_+/=.-])\S{8,}$/;
 
 /**
@@ -54,9 +61,11 @@ const CREDENTIAL_VALUE = /^(?=\S*[\d_+/=.-])\S{8,}$/;
 export function redactDeep(input) {
   let count = 0;
   const text = (value, key) => {
-    if (typeof key === "string" && AUTHORIZATION_FIELD.test(key) && value.trim() && !value.includes(MASK)) {
+    // An Authorization value is a credential whatever its shape. Only one that is already the mask
+    // in full, after its scheme, is left as it is.
+    if (typeof key === "string" && AUTHORIZATION_FIELD.test(key) && value.trim() && !ALREADY_MASKED.test(value)) {
       count += 1;
-      return value.replace(/^(\s*(?:Bearer|Basic)\s+)?[\s\S]*$/i, `$1${MASK}`);
+      return value.replace(/^(\s*(?:Bearer|Basic|Digest|Negotiate|NTLM)\s+)?[\s\S]*$/i, `$1${MASK}`);
     }
     if (typeof key === "string" && CREDENTIAL_FIELD.test(key) && CREDENTIAL_VALUE.test(value)) {
       count += 1;

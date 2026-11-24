@@ -93,10 +93,17 @@ export async function publishSession(input) {
     if (initial?.code === "space_claimed_credential_available" && input.claimToken && !input.accessToken && !exchangedAccessToken) {
       exchangedAccessToken = await exchangeClaimCredential({ apiUrl, claimToken: input.claimToken, fetchImpl });
       bearerToken = exchangedAccessToken;
-      // The Space now belongs to an account, which may have opened it up: check again before the upload goes through.
-      priorAccess = requestedSpace
-        ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: false })
-        : NO_ACCESS;
+      // The Space now belongs to an account, which may have opened it up: check again before the upload
+      // goes through. A Space that fails this check is no longer usable as the signed-out session Space,
+      // which is what the stage tells the caller, so it can start a new one.
+      try {
+        priorAccess = requestedSpace
+          ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: false })
+          : NO_ACCESS;
+      } catch (error) {
+        error.stage = "claim_exchange";
+        throw error;
+      }
       continue;
     }
     if (initial?.code !== "space_capacity_warming" || attempt === MAX_PUBLISH_ATTEMPTS) {

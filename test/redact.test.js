@@ -86,3 +86,19 @@ test("masks bare credential names and Authorization headers", () => {
   assert.deepEqual(fields.value[0].input, { Authorization: "Basic [redacted]", "Proxy-Authorization": "[redacted]", authorization: "" });
   assert.equal(fields.count, 2);
 });
+
+test("masks a quoted assignment up to its closing quote, and a whole Authorization value", () => {
+  const cases = [
+    ['API_TOKEN="first part second part" && deploy', 'API_TOKEN="[redacted]" && deploy'],
+    ["DB_PASSWORD='p@ss word 1234' psql", "DB_PASSWORD='[redacted]' psql"],
+    ['SECRET_KEY="abc \\"quoted\\" def" run', 'SECRET_KEY="[redacted]" run'],
+    ['{"cmd":"API_TOKEN=\\"first part second part\\" deploy"}', '{"cmd":"API_TOKEN=\\"[redacted]\\" deploy"}'],
+    ['Authorization: Digest username="u", response="6629fae49393a05397450978507c4ef1"', "Authorization: Digest [redacted]"],
+  ];
+  for (const [input, expected] of cases) assert.deepEqual(redactText(input), { text: expected, count: 1 });
+
+  const digest = 'Digest username="u", nonce="[redacted]", response="6629fae49393a05397450978507c4ef1"';
+  const fields = redactDeep([{ input: { Authorization: digest, authorization: "Bearer [redacted]" } }]);
+  assert.deepEqual(fields.value[0].input, { Authorization: "Digest [redacted]", authorization: "Bearer [redacted]" });
+  assert.equal(fields.count, 1, "a value that is already the mask in full is not counted again");
+});
