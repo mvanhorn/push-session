@@ -4,7 +4,8 @@ import { gunzipSync } from "node:zlib";
 const MASK = "[redacted]";
 
 // Well-known credential shapes, each with the kind it is counted as. A pattern keeps group 1 (a label
-// or prefix) and masks the rest. A third entry is a check the match must also pass.
+// or prefix) and masks the rest. A third entry is a check the match must also pass. The looser checks
+// belong to the any-case assignment rules only: the others mask whatever follows the name.
 const PATTERNS = [
   ["private-key", /()-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g],
   ["aws", /()\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g],
@@ -17,17 +18,19 @@ const PATTERNS = [
   ["google", /()(?<![\w-])AIza[A-Za-z0-9_-]{35}(?![\w-])/g],
   ["npm", /()(?<![\w-])npm_[A-Za-z0-9]{36}(?![\w-])/g],
   // The password of scheme://user:password@host; the user, which may be empty, and the host stay.
-  // Neither part runs past a quote or a bracket, so the match ends with the string the URL is in.
-  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@"'`\\<>{}]{1,512}(?=@[^\s/@"'`\\<>{}])/g, (value) => !isPlaceholder(value)],
+  // Neither part runs past a quote, a bracket, a query or a fragment, so the match stays inside the
+  // URL's own user and password and inside the string the URL is in.
+  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@?#"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@?#"'`\\<>{}]{1,512}(?=@[^\s/@?#"'`\\<>{}])/g, (value) => !isPlaceholder(value)],
   // Authorization headers: the scheme stays, the credential goes. In a header any length is a
   // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
-  ["authorization", /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi, (value) => !isPlaceholder(value)],
+  ["authorization", /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi],
   // Schemes whose credential is several fields. In a quoted value ("Authorization": "Digest ...") or
   // a quoted header ('Authorization: Digest ...') everything up to the closing quote goes, so what
   // follows it stays. Otherwise everything to the end of the line goes, unless it is the mask already.
-  ["authorization", /(\bAuthorization["']\s*:\s*(["'])(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi],
+  // The three shapes do not overlap: the last one takes neither a quoted value nor a quoted header.
+  ["authorization", /(\bAuthorization["']?\s*[:=]\s*(["'])(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi],
   ["authorization", /((["'])(?:Proxy-)?Authorization\s*:\s*(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi],
-  ["authorization", /(\bAuthorization["']?\s*[:=]\s*["']?(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\](?:["']|[ \t]*(?:\n|$)))[^\n]+/gi],
+  ["authorization", /((?:\bAuthorization["']|(?<!["'](?:Proxy-)?)\bAuthorization)\s*[:=]\s*(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\][ \t]*(?:\n|$))[^\n]+/gi],
   ["authorization", /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g],
   // Environment-style NAME_KEY=value assignments; the name stays readable. A quoted value is masked
   // up to its closing quote, spaces and escaped quotes included, so none of it is left behind.
@@ -39,7 +42,7 @@ const PATTERNS = [
   // A value that reading finds no end for, such as one whose last character is a backslash, is
   // masked up to the first quote after it instead of being left as it is.
   ["assignment", /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\|\\(?!\\|\2)[\s\S]|[^\\]){8,}?(?=\\\2)/g],
-  ["assignment", /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g, (value) => !isPlaceholder(value) && !isCall(value)],
+  ["assignment", /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g],
   // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
   // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
   ["assignment", /(["'][A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd)[A-Za-z0-9_-]*\\?["']\s*:\s*\\?["'])(?!\[redacted\])(?=[^\s"'\\]*[\d_+/=.-])[^\s"'\\]{8,}(?=\\?["'])/gi],
@@ -75,22 +78,39 @@ function isProperty(value) {
   return /^[A-Za-z_$][\w$]{0,23}(?:\.[A-Za-z_$][\w$]{0,23})+$/.test(value);
 }
 
-/** Masks the credentials in a string. `kinds` says how many of each kind were masked. */
+/**
+ * Masks the credentials in a string. `kinds` says how many of each kind were masked.
+ *
+ * Every pattern reads the text as it was written, and what they find is masked in one go. Matches
+ * that overlap become one mask over all of them, so a key inside a longer password takes the rest
+ * of the password with it, and no pattern ever reads another's mask.
+ */
 export function redactText(value) {
+  const found = [];
+  for (const [kind, pattern, check] of PATTERNS) {
+    for (const match of value.matchAll(pattern)) {
+      const start = match.index + match[1].length;
+      const end = match.index + match[0].length;
+      if (end > start && (!check || check(value.slice(start, end), match[1], value[end]))) found.push({ start, end, kind });
+    }
+  }
+  // Earliest first, and the longest of those that start together: its kind names the merged mask.
+  // The sort is stable, so of two equal matches the more specific pattern, listed first, wins.
+  found.sort((left, right) => left.start - right.start || right.end - left.end);
   const kinds = {};
   let count = 0;
-  let text = value;
-  for (const [kind, pattern, check] of PATTERNS) {
-    text = text.replace(pattern, (match, keep, ...rest) => {
-      // After the groups come the match's offset and the whole string.
-      const next = rest[rest.length - 1][rest[rest.length - 2] + match.length];
-      if (check && !check(match.slice(keep.length), keep, next)) return match;
-      kinds[kind] = (kinds[kind] || 0) + 1;
-      count += 1;
-      return `${keep}${MASK}`;
-    });
+  let text = "";
+  let offset = 0;
+  for (let index = 0; index < found.length; index += 1) {
+    const { start, kind } = found[index];
+    let { end } = found[index];
+    while (index + 1 < found.length && found[index + 1].start < end) end = Math.max(end, found[index += 1].end);
+    text += `${value.slice(offset, start)}${MASK}`;
+    kinds[kind] = (kinds[kind] || 0) + 1;
+    count += 1;
+    offset = end;
   }
-  return { text, count, kinds };
+  return { text: text + value.slice(offset), count, kinds };
 }
 
 // The secrets a gzipped tar holds, by kind: its files sit uncompressed inside, so the patterns apply

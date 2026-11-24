@@ -158,6 +158,8 @@ test("masks only the password of a URL with credentials", () => {
   assert.equal(redactText("redis://:s3cret123@cache.example.test:6379/0").text, "redis://:[redacted]@cache.example.test:6379/0");
   // A port is not a password, and the match stays inside the string the URL is in.
   assert.equal(redactText('{"base":"https://example.test:8080","password":"hunter2@secret"}').text, '{"base":"https://example.test:8080","password":"[redacted]"}');
+  // Userinfo ends at a query or a fragment, so an address in one is not a host.
+  for (const text of ["https://example.test:8080?email=alice@example.org/path", "https://example.test:8080#alice@example.org"]) assert.equal(redactText(text).count, 0, text);
   // A key that is the password is counted once, as the key.
   assert.deepEqual(redactText(`https://user:ghp_${"a".repeat(36)}@host.test`).kinds, { github: 1 });
 });
@@ -182,19 +184,25 @@ test("masks assignments in any case and with spaces, and leaves code and placeho
     ["PASSWORD=correct.horse.battery.staple", "PASSWORD=[redacted]"],
     ["PASSWORD=%40secret123", "PASSWORD=[redacted]"],
     ["PASSWORD=$ecret-123", "PASSWORD=[redacted]"],
+    // The header and NAME=value rules take whatever follows: a password may look like a variable or a call.
+    ["DB_PASSWORD=$uperS3cret99", "DB_PASSWORD=[redacted]"],
+    ["DB_PASSWORD=Secr3t(x)!abc", "DB_PASSWORD=[redacted]"],
+    ["API_KEY=abc(def)12345", "API_KEY=[redacted]"],
+    ["Authorization: Bearer $abcdefgh", "Authorization: Bearer [redacted]"],
+    // A key inside a longer value takes the rest of the value with it.
+    [`TOKEN=ghp_${"a".repeat(36)}!tail99`, "TOKEN=[redacted]"],
+    [`password = "ghp_${"a".repeat(36)}!suffix99"`, 'password = "[redacted]"'],
+    [`https://u:ghp_${"a".repeat(36)}%21suffix99@host.test/x`, "https://u:[redacted]@host.test/x"],
     ["https://user:%40secret123@host.test/db", "https://user:[redacted]@host.test/db"],
   ]) assert.equal(redactText(input).text, expected, input);
   for (const text of [
     "const apiKey = process.env.API_KEY",
     "const token = response.data.token2;",
     "const apiKey = userApiKey;",
-    "SECRET_KEY=getSecret()",
     "token = getToken2(session)",
     "const SECRET_KEY = /secret|token/i;",
-    "export GITHUB_TOKEN=$GH_TOKEN",
-    'curl -H "Authorization: Bearer <token>"',
-    "Authorization: Bearer ...",
-    "PASSWORD=********",
+    "api_key = $API_KEY",
+    "token = ${GITHUB_TOKEN_2}",
     "password=changeme",
     'tokenizer = "cl100k_base"',
     "max_tokens = 128000000",
