@@ -15,9 +15,18 @@ sessions and puts them in one searchable list, newest first. Titles come from
 the agent itself: your rename first, then the agent's own title, then your first
 real prompt. Subagent and sidechain transcripts stay out of the list.
 
-The picker shows 50 sessions per page. Use Next/Previous to browse older sessions,
-or choose "Search all sessions" to search across every page. `--limit <n>` changes
-the page size; it does not hide older sessions.
+The picker is one list of every session. Type to search all of them by title,
+project, agent or ID, or press Tab to show one agent's sessions; the line under
+the list says which. Each row starts with its agent's logo, or a text mark where
+the terminal cannot draw images. `--limit <n>` changes how many are shown at a time; it does
+not hide older sessions.
+
+Prefer a page? `npx push-session web` opens a picker in your browser: search,
+filter by agent, tick the sessions to publish, choose private or public, and
+publish them in one go. Ctrl+X in the terminal list switches to it. The page is
+served from this machine only, to the address the command prints; it takes the
+same publishing options (`--team`, `--space`, `--no-redact`), plus `--port <n>`
+and `--no-open`.
 
 T3 Code threads are read from `~/.t3/userdata/statev2.sqlite`, falling back to
 `state.sqlite` for V1 installations. `T3CODE_HOME` changes the base directory;
@@ -44,14 +53,32 @@ reuses your Space titled "AI sessions", or creates it.
 **Signed out:** sessions go to a claimable Space that lives on this machine.
 Claim it to keep the links, or run `sf login` to publish into your own Space.
 
-Each session gets its own route and a view-only share link scoped to it. Nobody
-can browse the rest of the Space with it.
+Each session gets its own route. Signed in, you choose who can open it:
+
+| Flag | Who can open the session |
+|---|---|
+| `--private` (default) | Your team, plus anyone with its view-only share link |
+| `--public` | Anyone with the address, no link needed |
+
+A share link is scoped to one session, so nobody can browse the rest of the
+Space with it. Signed in, a session's address is a random ID, not the agent's
+session ID, so a public session cannot be found by guessing. Publishing a session again without a flag keeps what it had; a
+flag changes it. Signed out, sessions are always private.
+
+The Space also gets a sessions page at its root. Your team sees every session
+there. Everyone else sees only the public ones, and nothing at all while no
+session is public.
 
 > Sessions can contain code, file paths, commands, and secrets. Review before
 > sharing. Anyone with the link can read it.
 
+Keys, tokens, passwords and private keys in well-known formats are masked as
+`[redacted]` before upload, and the count is reported. Masking is pattern based,
+so it can miss a secret; `--no-redact` turns it off. A session picked from the
+list asks who can open it before it is published.
+
 Options: `--pick-space`, `--space <id>`, `--new-space`, `--team <slug>`,
-`--limit <n>`, `--dry-run`, `--json`, and `--api-url <url>`.
+`--limit <n>`, `--public`, `--private`, `--no-redact`, `--dry-run`, `--json`, and `--api-url <url>`.
 
 ## What the page shows
 

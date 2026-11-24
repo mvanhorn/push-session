@@ -6,6 +6,8 @@ import { DEFAULT_API_URL } from "./auth.js";
 import { packageVersion } from "./version.js";
 
 const MAX_PUBLISH_ATTEMPTS = 10;
+const MAX_TRANSIENT_RETRIES = 3;
+const MAX_TRANSIENT_WAIT_MS = 30_000;
 const MAX_FOLLOW_STEPS = 80;
 const DEFAULT_INLINE_LIMIT = 100 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 6;
@@ -25,6 +27,12 @@ export async function publishSession(input) {
   if (files.some((file) => !file.path.startsWith(`${basePath}/`))) {
     throw new Error("Every published file must be inside the shared directory.");
   }
+  // The Space's own index pages live outside the session folder and are never covered by its share link.
+  files.push(...prepareFiles({ files: input.indexFiles || [] }));
+  const visibility = input.visibility || "private";
+  if (visibility === "public" && !input.accessToken) {
+    throw new Error("Public sessions need you signed in. Run `sf login` or set SPACEFAST_TOKEN.");
+  }
   if (new Set(files.map((file) => file.path)).size !== files.length) {
     throw new Error("The session contains duplicate publish paths.");
   }
@@ -41,22 +49,46 @@ export async function publishSession(input) {
     ...(!requestedSpace && input.access && { access: input.access }),
   };
   const inline = totalFileBytes(files) <= (input.inlineLimitBytes ?? DEFAULT_INLINE_LIMIT);
+  const priorAccess = requestedSpace && bearerToken
+    ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex })
+    : NO_ACCESS;
   let initial;
+  // Every attempt reuses the idempotency key, so retrying a publish cannot create a second one.
+  let transientFailures = 0;
 
   for (let attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt += 1) {
     const request = inline
       ? inlinePublishRequest(publishPayload, files)
       : manifestPublishRequest(publishPayload, files);
-    const response = await fetchImpl(`${apiUrl}/v1/publish?wait=1`, {
-      method: "POST",
-      headers: {
-        ...requestHeaders({ bearerToken, idempotencyKey, idempotencyPrincipal }),
-        ...request.headers,
-      },
-      body: request.body,
-    });
-    initial = await responseJson(response);
+    let response;
+    try {
+      response = await fetchImpl(`${apiUrl}/v1/publish?wait=1`, {
+        method: "POST",
+        headers: {
+          ...requestHeaders({ bearerToken, idempotencyKey, idempotencyPrincipal }),
+          ...request.headers,
+        },
+        body: request.body,
+      });
+      initial = await responseJson(response);
+    } catch (error) {
+      // fetch rejects with a TypeError when the network fails; a gateway's HTML error page is unreadable JSON.
+      const transient = response ? isTransientStatus(error.status) : error instanceof TypeError;
+      const wait = transient ? transientDelayMs(response, transientFailures) : null;
+      if (wait === null || transientFailures >= MAX_TRANSIENT_RETRIES) throw error;
+      transientFailures += 1;
+      await delay(wait);
+      continue;
+    }
     if (response.ok) break;
+    if (isTransientStatus(response.status) && initial?.code !== "space_capacity_warming" && transientFailures < MAX_TRANSIENT_RETRIES) {
+      const wait = transientDelayMs(response, transientFailures);
+      if (wait !== null) {
+        transientFailures += 1;
+        await delay(wait);
+        continue;
+      }
+    }
     if (initial?.code === "space_claimed_credential_available" && input.claimToken && !input.accessToken && !exchangedAccessToken) {
       exchangedAccessToken = await exchangeClaimCredential({ apiUrl, claimToken: input.claimToken, fetchImpl });
       bearerToken = exchangedAccessToken;
@@ -83,18 +115,17 @@ export async function publishSession(input) {
   const space = data?.space || initialData?.space;
   if (!space?.id) throw new Error("Spacefast returned a publish receipt without a space ID.");
 
-  const shareLink = await createScopedShareLink({
-    apiUrl,
-    bearerToken,
-    fetchImpl,
-    spaceId: space.id,
-    entryPath,
+  const liveUrl = space.liveUrl || initialData?.space?.liveUrl || null;
+  const landingUrl = liveUrl ? new URL(entryPath, ensureTrailingSlash(liveUrl)).href : null;
+  const shareLink = await grantAccess({
+    api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: space.id },
     basePath,
+    visibility,
+    publicIndex: input.publicIndex,
+    access: priorAccess,
     title: input.session?.title,
     shareName: input.shareName,
   });
-  const liveUrl = space.liveUrl || initialData?.space?.liveUrl || null;
-  const landingUrl = liveUrl ? new URL(entryPath, ensureTrailingSlash(liveUrl)).href : null;
   const claim = data?.claim || initialData?.claim;
   const version = data?.version || initialData?.version;
   const access = data?.access || initialData?.access;
@@ -103,8 +134,11 @@ export async function publishSession(input) {
     receipt,
     route: entryPath,
     basePath,
-    shareUrl: shareLink.url,
+    // Public and private sessions have no link of their own: their address is the session folder.
+    shareUrl: shareLink?.url || (liveUrl ? new URL(`${basePath}/`, ensureTrailingSlash(liveUrl)).href : null),
     landingUrl,
+    visibility,
+    publicSpace: priorAccess.publicSpace,
     link: shareLink,
     credential: exchangedAccessToken ? { accessToken: exchangedAccessToken } : null,
     space: {
@@ -200,8 +234,129 @@ async function uploadTargets({ targets, files, apiUrl, fetchImpl }) {
   }
 }
 
-async function createScopedShareLink({ apiUrl, bearerToken, fetchImpl, spaceId, entryPath, basePath, title, shareName }) {
-  if (!bearerToken) throw new Error("Spacefast published the session but did not return authority to create its private share link.");
+const INDEX_RESOURCES = ["/", "/index.html", "/sessions", "/sessions/index.html", "/sessions/public.json"];
+
+const NO_ACCESS = { links: [], publicGrants: [], indexGrants: [], publicSpace: false };
+
+/**
+ * Before anything is uploaded: reads the Space's access and takes away what the session's new
+ * visibility does not allow, so new content never goes live under access that is about to end.
+ * "private": the team plus anyone with the share link. "public": anyone.
+ */
+async function restrictAccess({ api, basePath, visibility, publicIndex }) {
+  const resources = sessionResources(basePath);
+  let entries;
+  try {
+    entries = await listSpaceAccess(api);
+  } catch (error) {
+    // A private publish that leaves the index alone can go on without the listing: a fresh link is
+    // always correct. Anything else must not, or a public grant could be left behind or doubled.
+    if (visibility !== "private" || publicIndex !== undefined) throw error;
+    return NO_ACCESS;
+  }
+  const scoped = (entry, include) => entry.target?.kind === "live"
+    && String(entry.capabilities) === "page.view"
+    && String(entry.resources?.include) === String(include)
+    && !entry.resources.exclude?.length;
+  const isPublic = (entry) => entry.subject?.audience === "public";
+  let publicGrants = entries.filter((entry) => isPublic(entry) && scoped(entry, resources));
+  const links = entries.filter((entry) => entry.subject?.audience === "link" && entry.subject.landingPath === resources[0] && scoped(entry, resources));
+  let indexGrants = entries.filter((entry) => isPublic(entry) && scoped(entry, INDEX_RESOURCES));
+  // A wider public grant, such as a public Space, opens the session whatever is set here.
+  const publicSpace = entries.some((entry) => isPublic(entry) && !publicGrants.includes(entry)
+    && (entry.resources?.include || []).some((pattern) => covers(pattern, resources[0]))
+    && !(entry.resources.exclude || []).some((pattern) => covers(pattern, resources[0])));
+  if (visibility !== "public") {
+    for (const entry of publicGrants) await revokeSpaceAccess(api, entry.id);
+    publicGrants = [];
+  }
+  if (publicIndex === false) {
+    for (const entry of indexGrants) await revokeSpaceAccess(api, entry.id);
+    indexGrants = [];
+  }
+  return { links, publicGrants, indexGrants, publicSpace };
+}
+
+/** After the upload: opens what the visibility asks for and returns the session's share link, if it has one. */
+async function grantAccess({ api, basePath, visibility, publicIndex, access, title, shareName }) {
+  if (!api.accessToken) throw new Error("Spacefast published the session but did not return authority to create its private share link.");
+  const grantPublic = (name, include) => createSpaceAccess(api, { audience: "public", name, capabilities: ["page.view"], resources: { include }, target: { kind: "live" } });
+  if (visibility === "public" && access.publicGrants.length === 0) await grantPublic(`Public session: ${title || basePath}`.slice(0, 120), sessionResources(basePath));
+  if (publicIndex === true && access.indexGrants.length === 0) await grantPublic("Public sessions index", INDEX_RESOURCES);
+  if (visibility !== "private") return null;
+  // Republishing keeps the link: a live link scoped to the session folder already serves the new files.
+  const reusable = access.links.find((entry) => entry.subject.url && !entry.constraints?.expiresAt && !entry.constraints?.maxUses);
+  if (reusable) return { id: reusable.subject.linkId, url: reusable.subject.url, reused: true };
+  return createScopedShareLink({ apiUrl: api.apiUrl, bearerToken: api.accessToken, fetchImpl: api.fetchImpl, spaceId: api.spaceId, basePath, title, shareName });
+}
+
+function sessionResources(basePath) {
+  return [`/${basePath}`, `/${basePath}/**`];
+}
+
+// Whether an access pattern such as "/**" or "/sessions/**" takes in a path.
+function covers(pattern, target) {
+  return pattern === target || (pattern.endsWith("/**") && `${target}/`.startsWith(pattern.slice(0, -2)));
+}
+
+/** Every way into a Space: people, links, public grants. */
+export async function listSpaceAccess({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId }) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access`, { headers: requestHeaders({ bearerToken: accessToken }) });
+  const body = await responseJson(response);
+  if (!response.ok) throw apiError(response, body);
+  return Array.isArray(body?.data) ? body.data : [];
+}
+
+async function createSpaceAccess({ apiUrl, accessToken, fetchImpl, spaceId }, entry) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access`, {
+    method: "POST",
+    headers: { ...requestHeaders({ bearerToken: accessToken }), "content-type": "application/json" },
+    body: JSON.stringify(entry),
+  });
+  const body = await responseJson(response);
+  if (!response.ok) throw apiError(response, body);
+  return body?.data;
+}
+
+async function revokeSpaceAccess({ apiUrl, accessToken, fetchImpl, spaceId }, grantId) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access/${encodeURIComponent(grantId)}`, {
+    method: "DELETE",
+    headers: requestHeaders({ bearerToken: accessToken }),
+  });
+  if (!response.ok && response.status !== 404) throw apiError(response, await responseJson(response));
+}
+
+/**
+ * Reads text files from a Space's live version. `select` picks from the paths the Space holds;
+ * the result carries every path and the contents of the selected ones.
+ */
+export async function readSpaceFiles({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId, select }) {
+  const headers = requestHeaders({ bearerToken: accessToken });
+  const space = `${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}`;
+  const listing = await fetchImpl(`${space}/files`, { headers });
+  const listed = await responseJson(listing);
+  if (!listing.ok) throw apiError(listing, listed);
+  const paths = (listed?.data?.files || []).map((file) => file.path);
+  const wanted = select(paths).slice(0, 200);
+  const contents = new Map();
+  if (wanted.length === 0) return { paths, contents };
+
+  // File bytes never travel through the API: it mints one short-lived read URL per path.
+  const query = wanted.map((file) => `path=${encodeURIComponent(file)}`).join("&");
+  const minted = await fetchImpl(`${space}/versions/${encodeURIComponent(listed.data.versionId)}/files/links?${query}`, { headers });
+  const links = await responseJson(minted);
+  if (!minted.ok) throw apiError(minted, links);
+  await Promise.all(wanted.map(async (file) => {
+    const url = links?.data?.links?.[file]?.url;
+    if (!url) throw new Error(`Spacefast returned no read link for ${file}.`);
+    const response = await fetchImpl(url);
+    if (!response.ok) throw new Error(`Could not read ${file} from the Space (${response.status}).`);
+    contents.set(file, await response.text());
+  }));
+  return { paths, contents };
+}
+
+async function createScopedShareLink({ apiUrl, bearerToken, fetchImpl, spaceId, basePath, title, shareName }) {
   const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/share-links`, {
     method: "POST",
     headers: {
@@ -314,8 +469,21 @@ async function responseJson(response) {
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`Spacefast returned an unreadable response (${response.status}).`);
+    const error = new Error(`Spacefast returned an unreadable response (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
+}
+
+function isTransientStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+// Backs off 1s, 2s, 4s unless the server names a wait. Null means the wait is too long to sit through.
+function transientDelayMs(response, failures) {
+  const seconds = Number.parseInt(response?.headers?.get("retry-after") || "", 10);
+  const wait = Number.isFinite(seconds) ? seconds * 1_000 : 1_000 * 2 ** failures;
+  return wait <= MAX_TRANSIENT_WAIT_MS ? wait : null;
 }
 
 function apiError(response, body) {

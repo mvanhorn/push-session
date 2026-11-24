@@ -80,6 +80,7 @@ test("publishes paged files and creates a page-view-only Spacefast link", async 
 test("updates a selected space with bearer authentication", async () => {
   const requests = [];
   const fetchImpl = async (url, init) => {
+    if (String(url).endsWith("/access")) return jsonResponse(200, { data: [] });
     requests.push({ url: String(url), init });
     if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/owned-link" } });
     return jsonResponse(201, {
@@ -124,6 +125,7 @@ test("exchanges a claimed anonymous key and continues on the same space", async 
   let publishAttempts = 0;
   const fetchImpl = async (url, init) => {
     const requestUrl = String(url);
+    if (requestUrl.endsWith("/access")) return jsonResponse(401, { code: "unauthorized" });
     requests.push({ url: requestUrl, init });
     if (requestUrl.endsWith("/claim/exchange")) {
       return jsonResponse(200, { data: { credential: { accessToken: "continued-access" } } });
@@ -243,3 +245,106 @@ function jsonResponse(status, body) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("retries transient publish failures with the same idempotency key", async () => {
+  const requests = [];
+  const failures = [
+    () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "retry-after": "0" } }),
+    () => new Response(JSON.stringify({ title: "Slow down" }), { status: 429, headers: { "retry-after": "0" } }),
+  ];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/link" } });
+    const failure = failures.shift();
+    if (failure) return failure();
+    return jsonResponse(201, { data: { space: { id: "spc_one" }, next: { action: "done" } } });
+  };
+  const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", accessToken: "token" });
+  assert.equal(result.shareUrl, "https://sessions.example/__/link");
+  const publishes = requests.filter((request) => request.url.includes("/v1/publish"));
+  assert.equal(publishes.length, 3);
+  assert.equal(new Set(publishes.map((request) => request.init.headers["idempotency-key"])).size, 1);
+
+  const denied = async () => jsonResponse(403, { title: "Forbidden" });
+  await assert.rejects(publishSession({ fetchImpl: denied, session: { id: "one" }, html: "ok" }), { status: 403 });
+  const hourLong = async () => new Response("{}", { status: 429, headers: { "retry-after": "3600" } });
+  await assert.rejects(publishSession({ fetchImpl: hourLong, session: { id: "one" }, html: "ok" }), { status: 429 });
+});
+
+test("republishing into a Space reuses the session's existing share link", async () => {
+  const link = (landingPath, overrides = {}) => ({
+    id: "grt_1",
+    subject: { audience: "link", linkId: `lnk_${landingPath.length}`, landingPath, url: `https://sessions.example/__${landingPath}` },
+    capabilities: ["page.view"],
+    resources: { include: [landingPath, `${landingPath}/**`], exclude: [] },
+    target: { kind: "live" },
+    ...overrides,
+  });
+  const publishWith = async (links) => {
+    const requests = [];
+    const fetchImpl = async (url, init = {}) => {
+      requests.push({ url: String(url), method: init.method || "GET" });
+      if (String(url).endsWith("/access")) return links ? jsonResponse(200, { data: links }) : jsonResponse(403, {});
+      if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { id: "lnk_new", url: "https://sessions.example/__/new" } });
+      return jsonResponse(201, { data: { space: { id: "spc_saved" }, next: { action: "done" } } });
+    };
+    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", accessToken: "token" });
+    return { result, created: requests.some((request) => request.url.endsWith("/share-links")) };
+  };
+
+  const reused = await publishWith([link("/sessions/other"), link("/sessions/one")]);
+  assert.equal(reused.result.shareUrl, "https://sessions.example/__/sessions/one");
+  assert.equal(reused.created, false);
+
+  const editorLink = link("/sessions/one", { capabilities: ["page.view", "comments.write"] });
+  const expiring = link("/sessions/one", { constraints: { expiresAt: "2030-01-01T00:00:00Z" } });
+  for (const links of [[link("/sessions/other")], [editorLink, expiring], null]) {
+    const fresh = await publishWith(links);
+    assert.equal(fresh.result.shareUrl, "https://sessions.example/__/new");
+    assert.equal(fresh.created, true);
+  }
+});
+
+test("public and private sessions adjust the Space's access instead of making a share link", async () => {
+  const session = ["/sessions/one", "/sessions/one/**"];
+  const index = ["/", "/index.html", "/sessions", "/sessions/index.html", "/sessions/public.json"];
+  const grant = (id, audience, include, subject = {}) => ({ id, subject: { audience, ...subject }, capabilities: ["page.view"], resources: { include, exclude: [] }, target: { kind: "live" } });
+  const publishWith = async (access, options) => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const target = new URL(url);
+      const method = init.method || "GET";
+      if (target.pathname.endsWith("/access") && method === "GET") return jsonResponse(200, { data: access });
+      if (target.pathname.includes("/access")) {
+        calls.push(method === "POST" ? `grant ${JSON.parse(init.body).audience} ${JSON.parse(init.body).resources.include[0]}` : `revoke ${target.pathname.split("/").pop()}`);
+        return jsonResponse(method === "POST" ? 201 : 200, { data: {} });
+      }
+      if (target.pathname.endsWith("/share-links")) { calls.push("link"); return jsonResponse(201, { data: { url: "https://sessions.example/__/new" } }); }
+      calls.push("upload");
+      return jsonResponse(201, { data: { space: { id: "spc_saved", liveUrl: "https://sessions.example/" }, next: { action: "done" } } });
+    };
+    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", accessToken: "token", ...options });
+    return { result, calls };
+  };
+
+  const made = await publishWith([], { visibility: "public", publicIndex: true });
+  assert.deepEqual(made.calls, ["upload", "grant public /sessions/one", "grant public /"]);
+  assert.equal(made.result.shareUrl, "https://sessions.example/sessions/one/");
+  assert.equal(made.result.visibility, "public");
+
+  const existing = [grant("grt_link", "link", session, { landingPath: "/sessions/one", url: "https://sessions.example/__/old" }), grant("grt_public", "public", session), grant("grt_index", "public", index), grant("grt_other", "public", ["/sessions/two", "/sessions/two/**"])];
+  assert.deepEqual((await publishWith(existing, { visibility: "public", publicIndex: true })).calls, ["upload"], "already public");
+  const closed = await publishWith(existing, { visibility: "private", publicIndex: false });
+  assert.deepEqual(closed.calls, ["revoke grt_public", "revoke grt_index", "upload"], "public access ends before the new content is live; the link stays");
+  assert.equal(closed.result.shareUrl, "https://sessions.example/__/old");
+  const linked = await publishWith(existing, { visibility: "private" });
+  assert.deepEqual(linked.calls, ["revoke grt_public", "upload"], "the index grant is left alone when the index was not rebuilt");
+  assert.equal(linked.result.shareUrl, "https://sessions.example/__/old");
+
+  // A public Space opens every session; the caller is told so it can warn.
+  const wholeSpace = [grant("grt_all", "public", ["/**"])];
+  assert.equal((await publishWith(wholeSpace, { visibility: "private" })).result.publicSpace, true);
+  assert.equal((await publishWith([grant("grt_other", "public", ["/sessions/two/**"])], { visibility: "private" })).result.publicSpace, false);
+
+  await assert.rejects(publishSession({ fetchImpl: async () => { throw new Error("no request expected"); }, session: { id: "one" }, html: "ok", visibility: "public" }), /need you signed in/);
+});

@@ -14,19 +14,28 @@ const MACOS_VALUE_PREFIX = "spacefast-keyring-v1:";
 /**
  * Resolves the credential for owned publishing. SPACEFAST_TOKEN wins; otherwise
  * the `sf login` credential is reused read-only. It is never copied into
- * push-session's own config.
+ * push-session's own config. `onSkip` hears why a stored login was not used:
+ * "unreadable", "expired", or "other_api" (with the login's API origin).
  */
-export async function resolveAuth({ env = process.env, apiUrl = DEFAULT_API_URL, keyring, platform = process.platform, now = Date.now() } = {}) {
+export async function resolveAuth({ env = process.env, apiUrl = DEFAULT_API_URL, keyring, platform = process.platform, now = Date.now(), onSkip } = {}) {
   if (env.SPACEFAST_TOKEN?.trim()) return { accessToken: env.SPACEFAST_TOKEN.trim(), source: "env", account: null };
   let stored;
   try {
     stored = await readSfLogin({ env, keyring, platform });
   } catch {
+    onSkip?.("unreadable");
     return null;
   }
   if (!stored?.accessToken) return null;
-  if (stored.expiresAt && !(Date.parse(stored.expiresAt) > now)) return null;
-  if (originOf(stored.apiUrl || DEFAULT_API_URL) !== originOf(apiUrl)) return null;
+  if (stored.expiresAt && !(Date.parse(stored.expiresAt) > now)) {
+    onSkip?.("expired");
+    return null;
+  }
+  const loginOrigin = originOf(stored.apiUrl || DEFAULT_API_URL);
+  if (loginOrigin !== originOf(apiUrl)) {
+    onSkip?.("other_api", loginOrigin);
+    return null;
+  }
   return { accessToken: stored.accessToken, source: "sf", account: stored.account || null };
 }
 

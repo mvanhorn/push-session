@@ -78,7 +78,13 @@ function extractCursorText(content) {
 }
 
 function cleanCursorText(value) {
-  return String(value || "")
+  const text = String(value || "");
+  // Cursor wraps what the user typed in <user_query> and adds its own blocks around it: when the
+  // prompt was sent, attached skills, open files. Only the query is the user's.
+  const queries = [...text.matchAll(/<user_query>([\s\S]*?)<\/user_query>/g)].map((match) => match[1].trim()).filter(Boolean);
+  if (queries.length > 0) return [...queries, ...(/<image_files>/.test(text) ? ["[image]"] : [])].join("\n");
+  return text
+    .replace(/<timestamp>[\s\S]*?<\/timestamp>/g, "")
     .replace(/<\/?user_query>/g, "")
     .replace(/<attached_files>[\s\S]*?<\/attached_files>/g, "")
     .replace(/<image_files>[\s\S]*?<\/image_files>/g, "[image]")

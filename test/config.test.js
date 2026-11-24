@@ -52,6 +52,11 @@ test("reuses a live sf login read-only, preferring the keyring and ignoring expi
   assert.equal((await resolveAuth({ env, now: before, keyring: { read: async () => { throw new Error("locked"); } } })).accessToken, "plaintext-token");
   assert.equal(await resolveAuth({ env, now: Date.parse("2031-01-01T00:00:00Z"), keyring: null }), null);
   assert.equal(await resolveAuth({ env, now: before, keyring: null, apiUrl: "https://api.staging.example" }), null);
+  const skipped = [];
+  const onSkip = (...reason) => skipped.push(reason);
+  await resolveAuth({ env, now: Date.parse("2031-01-01T00:00:00Z"), keyring: null, onSkip });
+  await resolveAuth({ env, now: before, keyring: null, apiUrl: "https://api.staging.example", onSkip });
+  assert.deepEqual(skipped, [["expired"], ["other_api", "https://api.spacefast.com"]]);
   assert.equal((await resolveAuth({ env: { ...env, SPACEFAST_TOKEN: "env-token" }, now: before, keyring: null })).source, "env");
   assert.equal(fs.readFileSync(authPath, "utf8"), login({ accessToken: "plaintext-token" }));
 
