@@ -427,6 +427,15 @@ async function publishAnonymous(context) {
     accessToken: publishAccessToken,
     claimToken,
     fetchImpl: dependencies.fetchImpl,
+    // A claimed Space's key is exchanged once, so its credential is saved before anything else can fail.
+    onCredential: (exchanged) => {
+      if (!configReadable || spaceId !== config.space?.id) return;
+      try {
+        rememberPublishResult(config, state, { credential: { accessToken: exchanged }, space: config.space }, env);
+      } catch (error) {
+        warn(`${error.message} The saved session space's new credential could not be saved.`);
+      }
+    },
   });
   let result;
   try {

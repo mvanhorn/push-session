@@ -145,6 +145,26 @@ test("replaces rejected implicit global state without blocking the publish", asy
   assert.match(warnings[0], /no longer reusable/);
 });
 
+test("keeps a claimed Space and its exchanged credential when the publish fails after the exchange", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-claimed-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
+  saveConfig({ version: 1, space: { id: "spc_claimed", liveUrl: "https://sessions.example/", claimToken: "old-key" } }, env);
+  const publishes = [];
+  const fetchImpl = async (url, init) => {
+    const target = String(url);
+    if (target.endsWith("/access")) return jsonResponse(init.headers.authorization === "Bearer continued-access" ? 500 : 401, { title: "No" });
+    if (target.endsWith("/claim/exchange")) return jsonResponse(200, { data: { credential: { accessToken: "continued-access" } } });
+    publishes.push(JSON.parse(init.body.get("payload")).spaceId || null);
+    return jsonResponse(409, { code: "space_claimed_credential_available", message: "Claimed" });
+  };
+
+  await assert.rejects(run(["codex", "session-one", "--json"], { adapters: [fakeAdapter()], env, fetchImpl, log: () => {}, warn: () => {} }), { status: 500 });
+
+  assert.deepEqual(publishes, ["spc_claimed"], "no new Space is made for an outage");
+  assert.deepEqual(loadConfig(env).space, { id: "spc_claimed", liveUrl: "https://sessions.example/", accessToken: "continued-access" });
+});
+
 test("alternate API publishes and unreadable config keep the saved anonymous space", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-one-off-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));

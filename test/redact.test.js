@@ -94,8 +94,14 @@ test("masks a quoted assignment up to its closing quote, and a whole Authorizati
     ['SECRET_KEY="abc \\"quoted\\" def" run', 'SECRET_KEY="[redacted]" run'],
     ['{"cmd":"API_TOKEN=\\"first part second part\\" deploy"}', '{"cmd":"API_TOKEN=\\"[redacted]\\" deploy"}'],
     ['Authorization: Digest username="u", response="6629fae49393a05397450978507c4ef1"', "Authorization: Digest [redacted]"],
+    // A value that only starts with the mask still has a credential after it.
+    ['Authorization: Digest [redacted], response="6629fae49393a05397450978507c4ef1"\nnext', "Authorization: Digest [redacted]\nnext"],
+    // Inside a JSON string a quote escaped within the value does not end it.
+    ['{"cmd":"API_TOKEN=\\"long enough \\\\\\"secret suffix\\\\\\" tail\\" deploy"}', '{"cmd":"API_TOKEN=\\"[redacted]\\" deploy"}'],
   ];
   for (const [input, expected] of cases) assert.deepEqual(redactText(input), { text: expected, count: 1 });
+
+  assert.deepEqual(redactText("Authorization: Digest [redacted]\nnext"), { text: "Authorization: Digest [redacted]\nnext", count: 0 });
 
   const digest = 'Digest username="u", nonce="[redacted]", response="6629fae49393a05397450978507c4ef1"';
   const fields = redactDeep([{ input: { Authorization: digest, authorization: "Bearer [redacted]" } }]);

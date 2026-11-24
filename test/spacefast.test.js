@@ -172,6 +172,22 @@ test("exchanges a claimed anonymous key and continues on the same space", async 
   publishAttempts = 0;
   await assert.rejects(publishSession({ fetchImpl, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key" }), { message: /This Space is public/, stage: "claim_exchange" });
   assert.equal(publishAttempts, 1, "only the first, refused attempt reached the publish endpoint");
+
+  // The same when the access cannot be read with the new credential. A Space it may not manage can be
+  // replaced; an outage is a failed publish to the same Space. Either way the credential is handed over.
+  for (const [status, stage] of [[403, "claim_exchange"], [500, undefined]]) {
+    const kept = [];
+    publishAttempts = 0;
+    const failing = (url, init) => (String(url).endsWith("/access") && init.headers.authorization === "Bearer continued-access"
+      ? jsonResponse(status, { title: "No" })
+      : fetchImpl(url, init));
+    await assert.rejects(
+      publishSession({ fetchImpl: failing, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key", onCredential: (token) => kept.push(token) }),
+      (error) => error.status === status && error.stage === stage,
+    );
+    assert.equal(publishAttempts, 1, "no second publish");
+    assert.deepEqual(kept, ["continued-access"]);
+  }
 });
 
 test("switches giant sessions to manifest uploads and follows upload receipts", async () => {

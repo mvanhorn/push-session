@@ -93,15 +93,18 @@ export async function publishSession(input) {
     if (initial?.code === "space_claimed_credential_available" && input.claimToken && !input.accessToken && !exchangedAccessToken) {
       exchangedAccessToken = await exchangeClaimCredential({ apiUrl, claimToken: input.claimToken, fetchImpl });
       bearerToken = exchangedAccessToken;
+      // The claim key is spent and the credential is given once: the caller keeps it whatever happens next.
+      input.onCredential?.(exchangedAccessToken);
       // The Space now belongs to an account, which may have opened it up: check again before the upload
-      // goes through. A Space that fails this check is no longer usable as the signed-out session Space,
-      // which is what the stage tells the caller, so it can start a new one.
+      // goes through. A Space that is public, or that the credential cannot manage, is no longer usable
+      // as the signed-out session Space, which is what the stage tells the caller, so it can start a
+      // new one. Any other failure is a failed publish to the same Space.
       try {
         priorAccess = requestedSpace
           ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: false })
           : NO_ACCESS;
       } catch (error) {
-        error.stage = "claim_exchange";
+        if (error.code === "space_public" || [401, 403, 404].includes(error.status)) error.stage = "claim_exchange";
         throw error;
       }
       continue;
@@ -285,7 +288,9 @@ async function restrictAccess({ api, basePath, visibility, publicIndex, rootInde
     && (entry.resources?.include || []).some((pattern) => covers(pattern, resources[0]))
     && !(entry.resources.exclude || []).some((pattern) => covers(pattern, resources[0])));
   if (publicSpace && visibility === "private") {
-    throw new Error("This Space is public, so a session in it is open to anyone. Publish with --public, or to a private Space (--pick-space or --space <id>).");
+    const error = new Error("This Space is public, so a session in it is open to anyone. Publish with --public, or to a private Space (--pick-space or --space <id>).");
+    error.code = "space_public";
+    throw error;
   }
   if (visibility !== "public") {
     for (const entry of publicGrants) await revokeSpaceAccess(api, entry.id);
