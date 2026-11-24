@@ -77,9 +77,13 @@ could open it there. Publish it with `--public`, or pick a private Space.
 > sharing. Anyone with the link can read it.
 
 Keys, tokens, passwords and private keys in well-known formats are masked as
-`[redacted]` before upload, and the count is reported. Masking is pattern based,
-so it can miss a secret; `--no-redact` turns it off. A session picked from the
-list asks who can open it before it is published.
+`[redacted]` before upload: API keys (Anthropic, OpenAI, GitHub, GitLab, Slack,
+Stripe live keys, AWS access key IDs, Google, npm), private-key blocks,
+`Authorization` values, URL passwords, and assignments to names such as
+`API_KEY`, `token` or `password`. The count is reported with a breakdown by
+kind; `--json` has it as `redacted` and `redactionCounts`. Masking is pattern
+based, so it can miss a secret; `--no-redact` turns it off. A session picked
+from the list asks who can open it before it is published.
 
 Options: `--pick-space`, `--space <id>`, `--new-space`, `--team <slug>`,
 `--limit <n>`, `--public`, `--private`, `--no-redact`, `--dry-run`, `--json`, and `--api-url <url>`.
