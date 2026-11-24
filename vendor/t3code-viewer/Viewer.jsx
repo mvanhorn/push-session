@@ -293,12 +293,14 @@ function MessageRail({ messages }) {
   useEffect(() => {
     if (entries.length < 2) return undefined;
     let frame = 0;
+    // Looked up on every scroll, so by ID, not by walking the list for each row.
+    const indexOf = new Map(entries.map((entry, index) => [entry.id, index]));
     const update = () => {
       frame = 0;
       let current = 0;
       for (const row of userRows()) {
-        const index = entries.findIndex((entry) => entry.id === row.dataset.messageId);
-        if (index >= 0 && row.getBoundingClientRect().top <= 120) current = index;
+        const index = indexOf.get(row.dataset.messageId);
+        if (index !== undefined && row.getBoundingClientRect().top <= 120) current = index;
       }
       setActive(current);
     };
