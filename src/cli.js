@@ -512,8 +512,9 @@ async function manageSessions(parsed, dependencies) {
     ? [savedOwned, savedAnonymous].find((saved) => saved?.id === options.space) || { id: options.space }
     : (auth && savedOwned) || savedAnonymous;
   if (!space?.id) throw new Error("No remembered session Space. Publish a session first or pass --space <id>.");
-  const ownSpace = savedAnonymous?.id === space.id;
-  const accessToken = auth?.accessToken || (ownSpace && (savedAnonymous.accessToken || savedAnonymous.claimToken)) || null;
+  // A signed-out Space answers to its own credential, not to an account it was never claimed into.
+  const signedOutSpace = savedAnonymous?.id === space.id ? savedAnonymous : null;
+  const accessToken = signedOutSpace?.accessToken || auth?.accessToken || signedOutSpace?.claimToken || null;
   if (!accessToken) throw new Error(MANAGE_SIGN_IN_MESSAGE);
   const api = { apiUrl, accessToken, fetchImpl: dependencies.fetchImpl };
   const inSpace = { ...api, spaceId: space.id };
@@ -582,7 +583,8 @@ async function manageSessions(parsed, dependencies) {
       await updateSpaceFiles({ ...inSpace, deletePaths, files: sessionIndexFiles(sessions, { spaceTitle: details.title, root: !index.rootTaken }) });
     } catch (error) {
       // The route, not what was typed: a link that was just ended no longer leads to the session.
-      error.message = `${error.message} Unshare stopped after ending ${revoked.linkIds.length} of ${own.links.length} links; file removal is not confirmed. Run \`push-session unshare ${basePath}\` to finish.`;
+      const again = ["push-session unshare", basePath, options.space && `--space ${options.space}`, options.apiUrl && `--api-url ${options.apiUrl}`, options.keepFiles && "--keep-files"].filter(Boolean).join(" ");
+      error.message = `${error.message} Unshare stopped after ending ${revoked.linkIds.length} of ${own.links.length} links; file removal is not confirmed. Run \`${again}\` to finish.`;
       throw error;
     }
     const result = { spaceId: space.id, route: basePath, revokedLinkIds: revoked.linkIds, revokedPublicAccess: revoked.publicGrants > 0, deletedPaths: deletePaths, keptFiles: options.keepFiles, stillPublic };
@@ -593,7 +595,10 @@ async function manageSessions(parsed, dependencies) {
     }
     return result;
   } catch (error) {
-    if (!auth && [401, 403].includes(error.status)) error.message = `${MANAGE_SIGN_IN_MESSAGE} ${error.message}`;
+    // Until it is claimed, a signed-out Space can be published to and nothing else.
+    if (signedOutSpace && !signedOutSpace.accessToken && [401, 403, 404].includes(error.status)) {
+      error.message = `This Space has not been claimed, so its sessions cannot be managed yet. Claim it${signedOutSpace.claimUrl ? ` at ${signedOutSpace.claimUrl}` : ""}, then run this again. ${error.message}`;
+    } else if (!auth && [401, 403].includes(error.status)) error.message = `${MANAGE_SIGN_IN_MESSAGE} ${error.message}`;
     throw error;
   }
 }

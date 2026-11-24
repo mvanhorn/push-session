@@ -164,9 +164,28 @@ test("a failed unshare names the session's route to finish with, since an ended 
   const space = fakeSpace(context);
   space.fail.add("POST /v1/publish");
   await assert.rejects(run(["unshare", `${LIVE}/__/one`, "--json"], space.dependencies), /ending 1 of 1 links; file removal is not confirmed\. Run `push-session unshare sessions\/aaaa-1111` to finish\./);
+  await assert.rejects(run(["unshare", "sessions/bbbb-2222", "--space", "spc_one", "--keep-files", "--json"], space.dependencies), /Run `push-session unshare sessions\/bbbb-2222 --space spc_one --keep-files` to finish\./);
   space.fail.clear();
   const finished = await run(["unshare", "sessions/aaaa-1111", "--json"], space.dependencies);
   assert.deepEqual([finished.revokedLinkIds, finished.deletedPaths.length], [[], 2]);
+});
+
+test("a signed-out Space is managed with its own credential, and says it must be claimed when it has none", async (context) => {
+  const space = fakeSpace(context);
+  const tokens = [];
+  const fetchImpl = (url, init = {}) => {
+    tokens.push(init.headers?.authorization);
+    if (init.headers?.authorization === "Bearer claim-key") return jsonResponse(403, { title: "Claim this space into a managed principal before using this endpoint." });
+    return space.dependencies.fetchImpl(url, init);
+  };
+  // Signed in, but the only Space this machine remembers was made signed out.
+  saveConfig({ version: 1, space: { id: "spc_one", liveUrl: `${LIVE}/`, accessToken: "space-key" } }, space.env);
+  const listed = await run(["list", "--json"], { ...space.dependencies, fetchImpl });
+  assert.equal(listed.sessions.length, 2);
+  assert.equal(tokens.filter(Boolean).every((token) => token === "Bearer space-key"), true, "the Space's own credential is used, not the account's");
+
+  saveConfig({ version: 1, space: { id: "spc_one", claimToken: "claim-key", claimUrl: "https://claim.example/one" } }, space.env);
+  await assert.rejects(run(["list"], { ...space.dependencies, fetchImpl, resolveAuth: async () => null }), /has not been claimed, so its sessions cannot be managed yet\. Claim it at https:\/\/claim\.example\/one/);
 });
 
 test("unshare asks first in a terminal, and both commands refuse what they cannot honour", async (context) => {
