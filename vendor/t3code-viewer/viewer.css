@@ -115,6 +115,173 @@ button { font: inherit; }
 .session-meta span { display: inline-flex; min-width: 0; align-items: center; gap: 6px; overflow-wrap: anywhere; }
 .session-meta svg { width: 14px; height: 14px; flex: none; color: var(--icon-muted); }
 
+.provider svg, .aside-provider svg { width: 14px; height: 14px; flex: none; }
+.provider { gap: 6px; }
+
+/* Copy as Markdown and Open in */
+.session-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; font-size: 13px; }
+.session-actions > button, .open-in summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+}
+.open-in summary::-webkit-details-marker { display: none; }
+.session-actions > button:hover, .open-in summary:hover, .open-in[open] summary { background: var(--accent); color: var(--foreground); }
+.session-actions svg { width: 14px; height: 14px; flex: none; }
+.open-in { position: relative; }
+.open-in .caret { margin-left: auto; }
+.open-in[open] .caret { transform: rotate(180deg); }
+.open-in-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 6;
+  display: grid;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 18%);
+}
+.open-in-menu a { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; color: var(--foreground); text-decoration: none; }
+.open-in-menu a:hover { background: var(--accent); }
+.open-in-menu a[aria-disabled="true"] { opacity: .5; pointer-events: none; }
+.open-in-menu svg { width: 15px; height: 15px; }
+.open-in-menu p { max-width: 200px; margin: 4px 0 0; padding: 6px 8px 4px; border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: 12px; line-height: 1.4; }
+
+/* Details and message rail: inline under the title by default, floating beside the transcript when there is room. */
+.session-aside { display: contents; }
+.session-meta .aside-provider, .message-rail { display: none; }
+
+/* Message list for screens without room for the rail: a button that opens a sheet. */
+.rail-open {
+  position: fixed;
+  right: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 22%);
+  color: var(--foreground);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.rail-open svg { width: 14px; height: 14px; color: var(--icon-muted); }
+.rail-sheet { position: fixed; inset: 0; z-index: 10; display: flex; align-items: flex-end; background: rgb(0 0 0 / 45%); }
+.rail-sheet-panel {
+  display: flex;
+  width: 100%;
+  max-height: 72vh;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  border-radius: 16px 16px 0 0;
+  background: var(--background);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.rail-sheet-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; font-size: 14px; }
+.rail-sheet-head button { display: grid; width: 32px; height: 32px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted-foreground); cursor: pointer; }
+.rail-sheet ol { overflow-y: auto; margin: 0; padding: 0 8px 12px; list-style: none; overscroll-behavior: contain; }
+.rail-sheet li button { display: flex; width: 100%; gap: 12px; padding: 10px 8px; border: 0; border-radius: 10px; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.rail-sheet li button[aria-current="true"] { background: var(--accent); }
+.rail-sheet .number { min-width: 22px; padding-top: 1px; color: var(--muted-foreground); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.rail-sheet .text { display: grid; min-width: 0; gap: 2px; }
+.rail-sheet .text strong { overflow: hidden; font-size: 14px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.rail-sheet .text small { display: -webkit-box; overflow: hidden; color: var(--muted-foreground); font-size: 13px; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.user-row { scroll-margin-top: 24px; }
+@media (min-width: 1280px) {
+  .rail-open, .rail-sheet { display: none; }
+  .session-aside {
+    position: fixed;
+    top: 56px;
+    left: calc(50% + 384px + 40px);
+    z-index: 5;
+    display: flex;
+    width: 208px;
+    max-height: calc(100vh - 80px);
+    flex-direction: column;
+    gap: 24px;
+  }
+  .session-aside .session-meta { flex-direction: column; flex-wrap: nowrap; gap: 8px; }
+  .session-meta .aside-provider { display: inline-flex; color: var(--foreground); font-weight: 550; }
+  .session-header .provider { display: none; }
+  .session-header .topline { justify-content: flex-end; }
+  .session-header h1 { margin-bottom: 0; }
+
+  .session-aside .session-actions { flex-direction: column; align-items: stretch; margin-top: 0; }
+  .session-aside .open-in-menu { right: auto; left: 0; }
+
+  /* The rail sits at the left edge of the window, centred on the screen: ticks, then the position. */
+  .message-rail {
+    position: fixed;
+    top: 50%;
+    left: 24px;
+    display: flex;
+    width: 40px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    transform: translateY(-50%);
+  }
+  .rail-count { color: var(--muted-foreground); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .message-rail ol {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    /* Dragging along the ticks scrubs through messages, so it must not scroll or select. */
+    touch-action: none;
+    user-select: none;
+  }
+  .message-rail li { display: flex; height: 12px; }
+  .message-rail li button { display: flex; width: 40px; flex: 1; align-items: center; padding: 0; border: 0; background: none; cursor: pointer; }
+  .message-rail li span {
+    width: 12px;
+    height: 2px;
+    border-radius: 1px;
+    background: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+    transition: width .12s ease, background-color .12s ease;
+  }
+  .message-rail li .near-2 span { width: 16px; }
+  .message-rail li .near-1 span { width: 20px; }
+  .message-rail li .near-0 span { width: 28px; background: var(--foreground); }
+  .message-rail li .fades span { opacity: .45; }
+  .message-rail li button:hover span, .message-rail li button:focus-visible span { background: var(--foreground); }
+  .rail-preview {
+    position: absolute;
+    left: calc(100% + 4px);
+    z-index: 2;
+    width: 320px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: 0 8px 28px rgb(0 0 0 / 18%);
+    font-size: 13px;
+    line-height: 1.45;
+    pointer-events: none;
+    transform: translateY(-50%);
+  }
+  .rail-preview strong { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+  .rail-preview p { display: -webkit-box; overflow: hidden; margin: 4px 0 0; color: var(--muted-foreground); -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+}
+@media (prefers-reduced-motion: reduce) { .message-rail li span { transition: none; } }
+
 /* Timeline */
 .timeline { padding: 28px 0 48px; }
 .timeline-row { padding-bottom: 16px; }
@@ -171,6 +338,8 @@ button { font: inherit; }
 }
 .timeline-row:hover > .message-actions,
 .message-actions:focus-within { opacity: 1; }
+/* Touch screens have no hover to reveal times and copy buttons. */
+@media (hover: none) { .message-actions, .work-chevron { opacity: 1; } }
 .assistant-actions { justify-content: flex-start; padding-inline: 0; margin-inline-start: -4px; }
 .assistant-model { color: var(--muted-foreground); }
 

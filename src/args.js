@@ -1,4 +1,5 @@
 const VALUE_FLAGS = new Set(["--space", "--team", "--api-url", "--limit", "--format", "--pr"]);
+const VISIBILITY_FLAGS = new Set(["--public", "--private"]);
 
 export function parseArgs(argv, env = process.env) {
   const options = {
@@ -7,13 +8,16 @@ export function parseArgs(argv, env = process.env) {
     format: "text",
     help: false,
     json: false,
-    limit: 50,
+    keepFiles: false,
+    limit: 12,
     newSpace: false,
     pickSpace: false,
     pr: false,
+    redact: true,
     space: undefined,
     team: undefined,
     version: false,
+    visibility: undefined,
     yes: false,
   };
   const positionals = [];
@@ -41,6 +45,12 @@ export function parseArgs(argv, env = process.env) {
     } else if (value === "--dry-run") options.dryRun = true;
     else if (value === "--new-space") options.newSpace = true;
     else if (value === "--pick-space") options.pickSpace = true;
+    else if (value === "--no-redact") options.redact = false;
+    else if (value === "--keep-files") options.keepFiles = true;
+    else if (VISIBILITY_FLAGS.has(value)) {
+      if (options.visibility) throw new Error("--public and --private cannot be used together.");
+      options.visibility = value.slice(2);
+    }
     else if (value.includes("=")) {
       const [flag, ...rest] = value.split("=");
       if (!VALUE_FLAGS.has(flag)) throw new Error(`Unknown option: ${flag}`);

@@ -14,19 +14,28 @@ const MACOS_VALUE_PREFIX = "spacefast-keyring-v1:";
 /**
  * Resolves the credential for owned publishing. SPACEFAST_TOKEN wins; otherwise
  * the `sf login` credential is reused read-only. It is never copied into
- * push-session's own config.
+ * push-session's own config. `onSkip` hears why a stored login was not used:
+ * "unreadable", "expired", or "other_api" (with the login's API origin).
  */
-export async function resolveAuth({ env = process.env, apiUrl = DEFAULT_API_URL, keyring, platform = process.platform, now = Date.now() } = {}) {
+export async function resolveAuth({ env = process.env, apiUrl = DEFAULT_API_URL, keyring, platform = process.platform, now = Date.now(), onSkip } = {}) {
   if (env.SPACEFAST_TOKEN?.trim()) return { accessToken: env.SPACEFAST_TOKEN.trim(), source: "env", account: null };
   let stored;
   try {
     stored = await readSfLogin({ env, keyring, platform });
   } catch {
+    onSkip?.("unreadable");
     return null;
   }
   if (!stored?.accessToken) return null;
-  if (stored.expiresAt && !(Date.parse(stored.expiresAt) > now)) return null;
-  if (originOf(stored.apiUrl || DEFAULT_API_URL) !== originOf(apiUrl)) return null;
+  if (stored.expiresAt && !(Date.parse(stored.expiresAt) > now)) {
+    onSkip?.("expired");
+    return null;
+  }
+  const loginOrigin = originOf(stored.apiUrl || DEFAULT_API_URL);
+  if (loginOrigin !== originOf(apiUrl)) {
+    onSkip?.("other_api", loginOrigin);
+    return null;
+  }
   return { accessToken: stored.accessToken, source: "sf", account: stored.account || null };
 }
 
@@ -34,17 +43,18 @@ export async function readSfLogin({ env = process.env, keyring, platform = proce
   const store = keyring === undefined ? (useKeyring(env) ? platformKeyring(env, platform) : null) : keyring;
   if (store) {
     let raw = null;
-    let keyringFailed = false;
+    let keyringError = null;
     try {
       raw = await store.read();
-    } catch {
-      keyringFailed = true;
+    } catch (error) {
+      keyringError = error;
     }
     if (raw) return parseStoredAuth(raw);
-    if (!keyringFailed) {
-      const fallback = readPlaintext(env);
-      return fallback === null ? null : parseStoredAuth(fallback);
-    }
+    const fallback = readPlaintext(env);
+    if (fallback !== null) return parseStoredAuth(fallback);
+    // A keyring that could not be read may hold a login: that is unreadable, not signed out.
+    if (keyringError) throw keyringError;
+    return null;
   }
   const fallback = readPlaintext(env);
   return fallback === null ? null : parseStoredAuth(fallback);
@@ -75,13 +85,10 @@ function readPlaintext(env) {
   return fs.readFileSync(authPath, "utf8");
 }
 
+// A stored login that is not JSON is damaged, not absent: it throws, so the caller hears "unreadable".
 function parseStoredAuth(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.accessToken === "string" ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = JSON.parse(raw);
+  return typeof parsed?.accessToken === "string" ? parsed : null;
 }
 
 function platformKeyring(env, platform) {

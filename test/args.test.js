@@ -62,3 +62,10 @@ test("rejects invalid formats and PR values", () => {
     assert.throws(() => parseArgs(["--pr", value]), /--pr must be/);
   }
 });
+
+test("visibility flags are exclusive and default to unset", () => {
+  assert.equal(parseArgs(["codex", "one"], {}).options.visibility, undefined);
+  assert.equal(parseArgs(["codex", "one", "--public"], {}).options.visibility, "public");
+  assert.equal(parseArgs(["codex", "one", "--private"], {}).options.visibility, "private");
+  assert.throws(() => parseArgs(["codex", "one", "--public", "--private"], {}), /cannot be used together/);
+});

@@ -15,9 +15,18 @@ sessions and puts them in one searchable list, newest first. Titles come from
 the agent itself: your rename first, then the agent's own title, then your first
 real prompt. Subagent and sidechain transcripts stay out of the list.
 
-The picker shows 50 sessions per page. Use Next/Previous to browse older sessions,
-or choose "Search all sessions" to search across every page. `--limit <n>` changes
-the page size; it does not hide older sessions.
+The picker is one list of every session. Type to search all of them by title,
+project, agent or ID, or press Tab to show one agent's sessions; the line under
+the list says which. Each row starts with its agent's logo, or a text mark where
+the terminal cannot draw images. `--limit <n>` changes how many are shown at a time; it does
+not hide older sessions.
+
+Prefer a page? `npx push-session web` opens a picker in your browser: search,
+filter by agent, tick the sessions to publish, choose private or public, and
+publish them in one go. Ctrl+X in the terminal list switches to it. The page is
+served from this machine only, to the address the command prints; it takes the
+same publishing options (`--team`, `--space`, `--no-redact`), plus `--port <n>`
+and `--no-open`.
 
 T3 Code threads are read from `~/.t3/userdata/statev2.sqlite`, falling back to
 `state.sqlite` for V1 installations. `T3CODE_HOME` changes the base directory;
@@ -44,15 +53,42 @@ reuses your Space titled "AI sessions", or creates it.
 **Signed out:** sessions go to a claimable Space that lives on this machine.
 Claim it to keep the links, or run `sf login` to publish into your own Space.
 
-Each session gets its own route and a view-only share link scoped to it. Nobody
-can browse the rest of the Space with it.
+Each session gets its own route. Signed in, you choose who can open it:
+
+| Flag | Who can open the session |
+|---|---|
+| `--private` (default) | Your team, plus anyone with its view-only share link |
+| `--public` | Anyone with the address, no link needed |
+
+A share link is scoped to one session, so nobody can browse the rest of the
+Space with it. Signed in, a session's address is a random ID, not the agent's
+session ID, so a public session cannot be found by guessing. Publishing a session again without a flag keeps what it had; a
+flag changes it. Signed out, sessions are always private.
+
+The Space also gets a sessions page at its root, and at `/sessions/`. Your team
+sees every session there. Everyone else sees only the public ones, and nothing at
+all while no session is public. A Space that already has its own home page keeps
+it: the sessions page is then at `/sessions/` only.
+
+A private session cannot go into a Space that is public as a whole, since anyone
+could open it there. Publish it with `--public`, or pick a private Space.
 
 > Sessions can contain code, file paths, commands, and secrets. Review before
 > sharing. Anyone with the link can read it.
 
+Keys, tokens, passwords and private keys in well-known formats are masked as
+`[redacted]` before upload: API keys (Anthropic, OpenAI, GitHub, GitLab, Slack,
+Stripe live keys, AWS access key IDs, Google, npm), private-key blocks,
+`Authorization` values, URL passwords, and assignments to names such as
+`API_KEY`, `token` or `password`. The count is reported with a breakdown by
+kind; `--json` has it as `redacted` and `redactionCounts`. Masking is pattern
+based, so it can miss a secret; `--no-redact` turns it off. A session picked
+from the list asks who can open it before it is published.
+
 Options: `--pick-space`, `--space <id>`, `--new-space`, `--team <slug>`,
-`--limit <n>`, `--dry-run`, `--pr [number|url]`, `--yes`,
-`--format markdown|text|json`, `--json`, and `--api-url <url>`.
+`--limit <n>`, `--public`, `--private`, `--no-redact`, `--dry-run`,
+`--pr [number|url]`, `--yes`, `--format markdown|text|json`, `--json`, and
+`--api-url <url>`.
 
 ## Share a session on a pull request
 
@@ -92,6 +128,32 @@ npx push-session claude <id> --format markdown
 `--format text` is the default. `--format json` (also `--json`) prints one JSON
 result, with PR details when requested and a `markdown` field if attachment fails.
 The warning goes to stderr. If output formats are repeated, the last one wins.
+
+## Manage what you've shared
+
+`list` shows the sessions in your Space: the agent, the title, who can open
+each one, when it was last active, and the address that opens it.
+
+```bash
+npx push-session list
+npx push-session list --json
+npx push-session unshare <session-id|route|url>
+npx push-session unshare <session-id> --keep-files
+npx push-session unshare <session-id> --yes
+```
+
+`unshare` takes a session back. It ends every share link scoped to that session
+and its public access, removes its files from the live Space (transcript pages
+and recovered artifacts included), and takes it off the sessions page. It asks
+for confirmation first. Use `--yes` to skip the prompt, or `--json` for a
+non-interactive result. Without a terminal, one of those flags is required.
+`--keep-files` ends the links and public access but leaves the files, so the
+session stays on the list for your team as a private one.
+Both commands accept `--space <id>` to manage another Space once. A signed-out
+Space has to be claimed before it can be managed.
+
+File removal affects the live version. Earlier immutable versions, downloaded
+copies, and broader Space access are not removed by `unshare`.
 
 ## What the page shows
 
