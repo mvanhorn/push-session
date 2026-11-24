@@ -158,7 +158,14 @@ test("masks only the password of a URL with credentials", () => {
   assert.equal(redactText("redis://:s3cret123@cache.example.test:6379/0").text, "redis://:[redacted]@cache.example.test:6379/0");
   // A port is not a password, and the match stays inside the string the URL is in.
   assert.equal(redactText('{"base":"https://example.test:8080","password":"hunter2@secret"}').text, '{"base":"https://example.test:8080","password":"[redacted]"}');
-  // Userinfo ends at a query or a fragment, so an address in one is not a host.
+  // A "#" or "?" pasted unencoded is part of the password, and so is a "$" that names no variable.
+  for (const [input, expected] of [
+    ["postgres://user:Pa#ss99word@db.example.com/app", "postgres://user:[redacted]@db.example.com/app"],
+    ["postgres://user:Pa?ss99word@db.example.com/app", "postgres://user:[redacted]@db.example.com/app"],
+    ["redis://:abc#123xyz@host:6379", "redis://:[redacted]@host:6379"],
+    ["postgres://u:$ecret12@host/db", "postgres://u:[redacted]@host/db"],
+  ]) assert.equal(redactText(input).text, expected, input);
+  // A port followed by a query or a fragment is not a password, whatever "@" comes later.
   for (const text of ["https://example.test:8080?email=alice@example.org/path", "https://example.test:8080#alice@example.org"]) assert.equal(redactText(text).count, 0, text);
   // A key that is the password is counted once, as the key.
   assert.deepEqual(redactText(`https://user:ghp_${"a".repeat(36)}@host.test`).kinds, { github: 1 });

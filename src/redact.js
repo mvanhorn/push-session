@@ -18,9 +18,10 @@ const PATTERNS = [
   ["google", /()(?<![\w-])AIza[A-Za-z0-9_-]{35}(?![\w-])/g],
   ["npm", /()(?<![\w-])npm_[A-Za-z0-9]{36}(?![\w-])/g],
   // The password of scheme://user:password@host; the user, which may be empty, and the host stay.
-  // Neither part runs past a quote, a bracket, a query or a fragment, so the match stays inside the
-  // URL's own user and password and inside the string the URL is in.
-  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@?#"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@?#"'`\\<>{}]{1,512}(?=@[^\s/@?#"'`\\<>{}])/g, (value) => !isPlaceholder(value)],
+  // Neither part runs past a quote or a bracket, so the match stays inside the string the URL is in.
+  // A password may hold a "?" or "#" that was pasted unencoded; a port followed by one is a query or
+  // fragment that happens to hold an "@", not a password.
+  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@?#"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@"'`\\<>{}]{1,512}(?=@[^\s/@?#"'`\\<>{}])/g, (value) => !isPlaceholder(value) && !/^\d{1,5}[?#]/.test(value)],
   // Authorization headers: the scheme stays, the credential goes. In a header any length is a
   // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
   ["authorization", /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi],
@@ -61,9 +62,10 @@ function namesCredential(keep) {
 }
 
 // Stand-ins and variable references are not secrets: ${TOKEN}, $API_KEY, $(cmd), <token>, {{key}},
-// %KEY%, ***, changeme. The whole value has to be one: a password may start with "$" or "%".
+// %KEY%, ***, changeme. The whole value has to be one, and a bare $name only in capitals: a password
+// may start with "$" or "%".
 function isPlaceholder(value) {
-  return /^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(.*\)|<[^<>]*>|\{\{?[^{}]*\}\}?|%[A-Za-z_][A-Za-z0-9_]*%|\[redacted\])$/.test(value)
+  return /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|\$\(.*\)|<[^<>]*>|\{\{?[^{}]*\}\}?|%[A-Za-z_][A-Za-z0-9_]*%|\[redacted\])$/.test(value)
     || /^(?:[.*x]+|pass(?:word)?|changeme|redacted)$/i.test(value);
 }
 
