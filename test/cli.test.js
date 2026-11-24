@@ -557,6 +557,7 @@ test("masks secrets by default, reports the count, and --no-redact publishes the
 
   const masked = await publish([]);
   assert.equal(masked.result.redacted, 2);
+  assert.deepEqual(masked.result.redactionCounts, { github: 1, assignment: 1 });
   assert.equal(masked.result.title, "Use API_KEY=[redacted]");
   assert.equal(masked.uploaded.includes("abcdefgh1234"), false);
   assert.equal(masked.uploaded.includes(secret), false);
@@ -564,6 +565,7 @@ test("masks secrets by default, reports the count, and --no-redact publishes the
 
   const raw = await publish(["--no-redact", "--new-space"]);
   assert.equal(raw.result.redacted, 0);
+  assert.deepEqual(raw.result.redactionCounts, {});
   assert.equal(raw.uploaded.includes(secret), true);
 });
 
