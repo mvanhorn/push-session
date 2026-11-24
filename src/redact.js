@@ -10,7 +10,9 @@ const PATTERNS = [
   /()\bsk-[A-Za-z0-9_-]{20,}/g,
   /()\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g,
   /()\bxox[abeprs]-[A-Za-z0-9-]{10,}/g,
-  // Authorization headers: the scheme stays, the credential goes.
+  // Authorization headers: the scheme stays, the credential goes. In a header any length is a
+  // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
+  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi,
   /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g,
   // Environment-style NAME_KEY=value assignments; the name stays readable.
   /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\?["']?)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
@@ -42,6 +44,7 @@ function archiveSecrets(content) {
 }
 
 const CREDENTIAL_FIELD =/api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd/i;
+const AUTHORIZATION_FIELD = /^(?:proxy-)?authorization$/i;
 const CREDENTIAL_VALUE = /^(?=\S*[\d_+/=.-])\S{8,}$/;
 
 /**
@@ -51,6 +54,10 @@ const CREDENTIAL_VALUE = /^(?=\S*[\d_+/=.-])\S{8,}$/;
 export function redactDeep(input) {
   let count = 0;
   const text = (value, key) => {
+    if (typeof key === "string" && AUTHORIZATION_FIELD.test(key) && value.trim() && !value.includes(MASK)) {
+      count += 1;
+      return value.replace(/^(\s*(?:Bearer|Basic)\s+)?[\s\S]*$/i, `$1${MASK}`);
+    }
     if (typeof key === "string" && CREDENTIAL_FIELD.test(key) && CREDENTIAL_VALUE.test(value)) {
       count += 1;
       return MASK;

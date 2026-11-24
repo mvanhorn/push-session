@@ -123,9 +123,15 @@ test("lists only owned Spaces and surfaces problem details", async () => {
 test("exchanges a claimed anonymous key and continues on the same space", async () => {
   const requests = [];
   let publishAttempts = 0;
+  const accessChecks = [];
+  let accessAfterClaim = [];
   const fetchImpl = async (url, init) => {
     const requestUrl = String(url);
-    if (requestUrl.endsWith("/access")) return jsonResponse(401, { code: "unauthorized" });
+    // The spent claim key cannot list access; the credential it is exchanged for can.
+    if (requestUrl.endsWith("/access")) {
+      accessChecks.push(init.headers.authorization);
+      return init.headers.authorization === "Bearer continued-access" ? jsonResponse(200, { data: accessAfterClaim }) : jsonResponse(401, { code: "unauthorized" });
+    }
     requests.push({ url: requestUrl, init });
     if (requestUrl.endsWith("/claim/exchange")) {
       return jsonResponse(200, { data: { credential: { accessToken: "continued-access" } } });
@@ -159,6 +165,13 @@ test("exchanges a claimed anonymous key and continues on the same space", async 
   assert.equal(requests[3].init.headers.authorization, "Bearer continued-access");
   assert.equal(result.space.id, "spc_claimed");
   assert.equal(result.credential.accessToken, "continued-access");
+  assert.deepEqual(accessChecks, ["Bearer old-claim-key", "Bearer continued-access"], "access is checked again with the exchanged credential");
+
+  // Whoever claimed the Space may have made it public: the retry then stops before uploading.
+  accessAfterClaim = [{ id: "grt_all", subject: { audience: "public" }, capabilities: ["page.view"], resources: { include: ["/**"], exclude: [] }, target: { kind: "live" } }];
+  publishAttempts = 0;
+  await assert.rejects(publishSession({ fetchImpl, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key" }), /This Space is public/);
+  assert.equal(publishAttempts, 1, "only the first, refused attempt reached the publish endpoint");
 });
 
 test("switches giant sessions to manifest uploads and follows upload receipts", async () => {

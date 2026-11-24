@@ -43,17 +43,18 @@ export async function readSfLogin({ env = process.env, keyring, platform = proce
   const store = keyring === undefined ? (useKeyring(env) ? platformKeyring(env, platform) : null) : keyring;
   if (store) {
     let raw = null;
-    let keyringFailed = false;
+    let keyringError = null;
     try {
       raw = await store.read();
-    } catch {
-      keyringFailed = true;
+    } catch (error) {
+      keyringError = error;
     }
     if (raw) return parseStoredAuth(raw);
-    if (!keyringFailed) {
-      const fallback = readPlaintext(env);
-      return fallback === null ? null : parseStoredAuth(fallback);
-    }
+    const fallback = readPlaintext(env);
+    if (fallback !== null) return parseStoredAuth(fallback);
+    // A keyring that could not be read may hold a login: that is unreadable, not signed out.
+    if (keyringError) throw keyringError;
+    return null;
   }
   const fallback = readPlaintext(env);
   return fallback === null ? null : parseStoredAuth(fallback);

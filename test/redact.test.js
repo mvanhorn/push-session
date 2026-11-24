@@ -78,4 +78,11 @@ test("masks bare credential names and Authorization headers", () => {
   for (const [input, expected] of cases) assert.equal(redactText(input).text, expected);
   assert.equal(redactDeep([{ input: { Authorization: "Bearer abcdefghijklmnopqrstuvwxyz012345" } }]).value[0].input.Authorization, "Bearer [redacted]");
   for (const plain of ["Bearer authentication is required", "Basic usage of the tool"]) assert.equal(redactText(plain).count, 0);
+
+  // In a header even a short credential is one, in text and as a field.
+  assert.deepEqual(redactText("Authorization: Basic dTpw"), { text: "Authorization: Basic [redacted]", count: 1 });
+  assert.deepEqual(redactText('{"authorization": "Bearer abc"}'), { text: '{"authorization": "Bearer [redacted]"}', count: 1 });
+  const fields = redactDeep([{ input: { Authorization: "Basic dTpw", "Proxy-Authorization": "dTpw", authorization: "" } }]);
+  assert.deepEqual(fields.value[0].input, { Authorization: "Basic [redacted]", "Proxy-Authorization": "[redacted]", authorization: "" });
+  assert.equal(fields.count, 2);
 });

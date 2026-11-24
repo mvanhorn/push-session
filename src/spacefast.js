@@ -50,7 +50,7 @@ export async function publishSession(input) {
     ...(!requestedSpace && input.access && { access: input.access }),
   };
   const inline = totalFileBytes(files) <= (input.inlineLimitBytes ?? DEFAULT_INLINE_LIMIT);
-  const priorAccess = requestedSpace && bearerToken
+  let priorAccess = requestedSpace && bearerToken
     ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: !input.accessToken })
     : NO_ACCESS;
   let initial;
@@ -93,6 +93,10 @@ export async function publishSession(input) {
     if (initial?.code === "space_claimed_credential_available" && input.claimToken && !input.accessToken && !exchangedAccessToken) {
       exchangedAccessToken = await exchangeClaimCredential({ apiUrl, claimToken: input.claimToken, fetchImpl });
       bearerToken = exchangedAccessToken;
+      // The Space now belongs to an account, which may have opened it up: check again before the upload goes through.
+      priorAccess = requestedSpace
+        ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: false })
+        : NO_ACCESS;
       continue;
     }
     if (initial?.code !== "space_capacity_warming" || attempt === MAX_PUBLISH_ATTEMPTS) {
