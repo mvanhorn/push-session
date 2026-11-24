@@ -94,6 +94,9 @@ function isSubagentSource(source) {
 }
 
 function codexTitle(text) {
+  // A run Codex starts itself, such as `codex review`, has no prompt; name it by what it did.
+  const action = /^\s*<user_action>[\s\S]*?<action>\s*([\w -]{1,40}?)\s*<\/action>/.exec(String(text || ""));
+  if (action) return `Codex ${action[1]}`;
   return deriveTitle(String(text || "").replace(CODEX_TITLE_PREAMBLE, ""));
 }
 
@@ -271,7 +274,19 @@ function hasMatchingEventUser(messages, text) {
 }
 
 function extractOutput(value) {
-  return value && typeof value === "object" && "output" in value ? value.output : value;
+  const output = value && typeof value === "object" && "output" in value ? value.output : value;
+  return isContentItems(output) ? contentItemsText(output) : output;
+}
+
+function isContentItems(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((item) => typeof item?.type === "string");
+}
+
+// Codex returns some tool output as content items; an image item would otherwise publish its base64 data.
+function contentItemsText(items) {
+  return items
+    .map((item) => (typeof item.text === "string" ? item.text : item.type.includes("image") ? "[image]" : JSON.stringify(item)))
+    .join("\n");
 }
 
 function toolFailed(value) {

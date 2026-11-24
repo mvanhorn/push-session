@@ -22,6 +22,8 @@ Upstream sources:
 - `packages/shared/src/toolActivity.ts` (`classifyToolActivity`,
   `formatSearchToolLabel`, `formatReadToolLabel`, `dynamicToolTitle`)
 - `packages/contracts/src/providerRuntime.ts` (item and status vocabulary)
+- `apps/web/src/components/Icons.tsx` (`ClaudeAI`, `OpenAI`, `CursorIcon`) and
+  `T3Wordmark.tsx` (logo paths, in `t3/providerIcons.jsx`)
 
 The extraction lives in `t3/MessagesTimeline.jsx`, `t3/ChatMarkdown.jsx`, and
 `t3/workLogPresentation.js`, and is imported by the viewer entrypoint. App-only
@@ -40,3 +42,8 @@ Published transcript pages use T3 Code's provider-runtime item vocabulary
 
 T3 Code is Copyright (c) 2026 T3 Tools Inc. and licensed under the MIT License;
 see `LICENSE` in this directory.
+
+The Pi logo in `t3/providerLogos.js` is from [Pi](https://github.com/earendil-works/pi),
+revision `8209929fb553e7a8c91dc0894569f9ec43dd201f`, `apps/p2/public/icons/favicon.svg`,
+MIT licensed. Pi's terminal text mark (a coral P and a yellow i) follows
+`packages/coding-agent/src/modes/interactive/components/pi-logo.ts`.

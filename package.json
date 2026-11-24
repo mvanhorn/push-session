@@ -54,6 +54,7 @@
     "node": ">=20.19"
   },
   "dependencies": {
+    "@clack/core": "^1.4.3",
     "@clack/prompts": "^1.2.0",
     "picocolors": "^1.1.1"
   },

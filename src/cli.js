@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 
 import * as clack from "@clack/prompts";
@@ -11,6 +12,9 @@ import { runArtifacts } from "./artifacts/cli.js";
 import { renderSessionWithArtifacts } from "./artifacts/session.js";
 import { discoverCodexSessionSites } from "./artifacts/sites.js";
 import { resolveAuth } from "./auth.js";
+import { redactDeep, redactText } from "./redact.js";
+import { indexEntry, loadSessionIndex, sessionIndexFiles } from "./session-index.js";
+import { OPEN_WEB, pickSession } from "./session-picker.js";
 import {
   configPath,
   loadConfig,
@@ -21,6 +25,8 @@ import {
   selectPublishState,
 } from "./config.js";
 import { listSpaces, publishSession } from "./spacefast.js";
+import { drawAgentLogos } from "./terminal-logos.js";
+import { runWeb } from "./web.js";
 import { packageVersion } from "./version.js";
 
 export const OWNED_SPACE_TITLE = "AI sessions";
@@ -29,6 +35,13 @@ const AUTOCOMPLETE_AFTER = 8;
 
 export async function run(argv = process.argv.slice(2), dependencies = {}) {
   if (argv[0] === "artifacts") return runArtifacts(argv.slice(1), dependencies);
+  if (argv[0] === "web") {
+    if (argv.includes("-h") || argv.includes("--help")) return printHelp();
+    if (argv.includes("-v") || argv.includes("--version")) return console.log(packageVersion);
+    // Each publish from the page is an ordinary non-interactive run for one session.
+    const publish = (args) => run(args, { ...dependencies, interactive: false, log: () => {}, warn: () => {} });
+    return runWeb(argv.slice(1), { publish, dependencies });
+  }
   const env = dependencies.env || process.env;
   const parsed = parseArgs(argv, env);
   if (parsed.options.help) return printHelp();
@@ -51,12 +64,27 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
     requestedSession: parsed.sessionId,
     interactive,
     limit: parsed.options.limit,
+    // The browser picker publishes for real, to the saved Space: not offered where that differs from what was asked.
+    web: !parsed.options.dryRun && !parsed.options.newSpace && !parsed.options.pickSpace,
     availableAdapters,
     prompts,
     warn,
   });
-  const messages = await selection.adapter.load(selection.session);
-  if (messages.length === 0) throw new Error("That session has nothing to share yet.");
+  if (selection.web) {
+    // Ctrl+X in the list: carry on in the browser, with the same publishing options.
+    const { team, space, apiUrl, redact } = parsed.options;
+    const forwarded = [...(team ? ["--team", team] : []), ...(space ? ["--space", space] : []), ...(apiUrl ? ["--api-url", apiUrl] : []), ...(redact ? [] : ["--no-redact"])];
+    return run(["web", ...forwarded], dependencies);
+  }
+  const loaded = await selection.adapter.load(selection.session);
+  if (loaded.length === 0) throw new Error("That session has nothing to share yet.");
+  let { value: messages, count: redacted } = parsed.options.redact ? redactDeep(loaded) : { value: loaded, count: 0 };
+  if (parsed.options.redact && selection.session.title) {
+    // The title is usually the first prompt, so it can carry the same secrets as the transcript.
+    const title = redactText(selection.session.title);
+    selection.session = { ...selection.session, title: title.text };
+    redacted += title.count;
+  }
 
   let artifacts = [];
   let sites = [];
@@ -78,7 +106,14 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
       warn(`Could not recover this session's ChatGPT Sites: ${error.message}. Publishing the transcript without them.`);
     }
   }
-  const bundle = renderSessionWithArtifacts(selection.session, messages, artifacts, { sites });
+  if (parsed.options.redact) {
+    // Recovered artifact and Site sources are published too, so they get the same masking.
+    const sources = redactDeep({ artifacts, sites });
+    ({ artifacts, sites } = sources.value);
+    redacted += sources.count;
+  }
+  const renderBundle = (basePath) => renderSessionWithArtifacts(selection.session, messages, artifacts, { sites, ...(basePath && { basePath }) });
+  const bundle = renderBundle();
   if (parsed.options.dryRun) {
     const result = {
       dryRun: true,
@@ -93,11 +128,12 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
       sites: bundle.siteCount,
       siteVersions: bundle.siteVersions,
       recoveredSiteVersions: bundle.recoveredSiteVersions,
+      redacted,
       route: bundle.entryPath,
     };
     if (parsed.options.json) log(JSON.stringify(result));
     else {
-      prompts.note(`${result.messages} transcript entries\n${result.pages} JSON page${result.pages === 1 ? "" : "s"}\n${result.artifacts} Claude artifact${result.artifacts === 1 ? "" : "s"}\n${result.sites} ChatGPT Site${result.sites === 1 ? "" : "s"}\n${result.bytes.toLocaleString()} bytes\n${result.route}`, "Ready to publish");
+      prompts.note(`${result.messages} transcript entries\n${result.pages} JSON page${result.pages === 1 ? "" : "s"}\n${result.artifacts} Claude artifact${result.artifacts === 1 ? "" : "s"}\n${result.sites} ChatGPT Site${result.sites === 1 ? "" : "s"}\n${result.bytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact)}\n${result.route}`, "Ready to publish");
       prompts.outro("Dry run. Nothing left your machine.");
     }
     return result;
@@ -114,8 +150,40 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   const apiUrl = resolveApiUrl(config, parsed.options);
-  const auth = await (dependencies.resolveAuth || resolveAuth)({ env, apiUrl, keyring: dependencies.keyring });
-  const context = { parsed, config, configReadable, apiUrl, auth, env, interactive, prompts, warn, dependencies, selection, bundle };
+  let skippedLogin = null;
+  const auth = await (dependencies.resolveAuth || resolveAuth)({
+    env,
+    apiUrl,
+    keyring: dependencies.keyring,
+    onSkip: (reason, loginOrigin) => { skippedLogin = { reason, loginOrigin }; },
+  });
+  // A login that exists but can't be used must not silently turn into a claimable Space.
+  if (!auth && skippedLogin?.reason === "expired") {
+    throw new Error("Your sf login has expired. Run `sf login` again, or set SPACEFAST_TOKEN.");
+  }
+  if (!auth && skippedLogin?.reason === "unreadable") {
+    throw new Error("Couldn't read your sf login. Run `sf login` again, or set SPACEFAST_TOKEN.");
+  }
+  if (!auth && skippedLogin?.reason === "other_api") {
+    warn(`Your sf login is for ${skippedLogin.loginOrigin}, not ${apiUrl}. Publishing signed out.`);
+  }
+  if (!auth && parsed.options.visibility === "public") {
+    throw new Error(`--${parsed.options.visibility} needs you signed in. Run \`sf login\` or set SPACEFAST_TOKEN.`);
+  }
+  // A session picked from the list gets one look before it leaves the machine; an explicit ID asks nothing.
+  const review = interactive && !parsed.sessionId;
+  if (review) {
+    prompts.note(`${messages.length} transcript entries · ${bundle.totalBytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact)}`, selection.session.title);
+  } else if (redacted > 0) {
+    warn(redactionLine(redacted, true));
+  }
+  // Signed in, the review is the question of who may open the session; signed out there is one answer.
+  if (review && !auth) {
+    const confirmed = await prompts.confirm({ message: "Publish this session?" });
+    cancelIfNeeded(prompts, confirmed);
+    if (!confirmed) return nothingPublished(prompts);
+  }
+  const context = { parsed, config, configReadable, apiUrl, auth, env, interactive, prompts, warn, dependencies, selection, bundle, renderBundle, review };
   const result = auth ? await publishOwned(context) : await publishAnonymous(context);
 
   const output = {
@@ -130,6 +198,8 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
     sites: bundle.siteCount,
     siteVersions: bundle.siteVersions,
     recoveredSiteVersions: bundle.recoveredSiteVersions,
+    redacted,
+    visibility: result.visibility,
     versionUrl: result.versionUrl,
     spaceId: result.space.id,
     spaceTitle: result.space.title || null,
@@ -150,9 +220,22 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
 }
 
 async function publishOwned(context) {
-  const { parsed, config, configReadable, apiUrl, auth, env, interactive, prompts, warn, dependencies, selection, bundle } = context;
+  const { parsed, config, configReadable, apiUrl, auth, env, interactive, prompts, warn, dependencies, selection, renderBundle, review } = context;
   const fetchImpl = dependencies.fetchImpl;
   const api = { apiUrl, accessToken: auth.accessToken, fetchImpl };
+  // Null means the Space's session list could not be read, so its index page is left as it is.
+  let unreadable = null;
+  const loadIndex = async (space) => {
+    unreadable = null;
+    if (!space.id) return { sessions: [], rootTaken: false };
+    try {
+      return await loadSessionIndex(api, space.id, { first: context.bundle.basePath });
+    } catch (error) {
+      // A Space that is gone is reported by the publish itself.
+      if (![403, 404].includes(error?.status)) unreadable = error;
+      return null;
+    }
+  };
   const remember = (space) => {
     if (!configReadable) return;
     try {
@@ -184,7 +267,42 @@ async function publishOwned(context) {
     }
   }
 
+  // A session keeps the address it was first published at. A new one gets a random address, so a
+  // public session cannot be found by guessing its ID.
+  const legacyPath = context.bundle.basePath;
+  const place = async (space) => {
+    const index = await loadIndex(space);
+    const list = index && index.sessions;
+    if (unreadable) {
+      throw new Error(`Could not read this Space's session list (${unreadable.message}), so this session's address and who can open it are unknown. Nothing was published; try again.`);
+    }
+    const known = list?.find((entry) => (entry.sessionId === selection.session.id && entry.agent === selection.adapter.id) || entry.path === legacyPath);
+    return { list, root: !index?.rootTaken, bundle: renderBundle(known?.path || `sessions/${randomUUID()}`) };
+  };
+  let { list: sessions, root, bundle } = await place(target);
+  const saved = sessions?.find((session) => session.path === bundle.basePath)?.visibility;
+  let visibility = parsed.options.visibility;
+  let chosen = Boolean(visibility);
+  if (!visibility && review) {
+    visibility = await prompts.select({
+      message: "Who can open this session?",
+      initialValue: saved || "private",
+      options: [
+        { value: "private", label: "Only people with the link", hint: "private" },
+        { value: "public", label: "Everyone", hint: "public, no link needed" },
+      ],
+    });
+    cancelIfNeeded(prompts, visibility);
+    chosen = true;
+  }
+  // Republishing without a flag keeps what the session already had.
+  visibility ||= saved || "private";
+
   const publish = (space, teamId) => {
+    const listed = sessions && [
+      ...sessions.filter((session) => session.path !== bundle.basePath),
+      indexEntry({ path: bundle.basePath, session: selection.session, messages: bundle.stats?.messages, visibility }),
+    ];
     const spinner = interactive ? prompts.spinner() : null;
     spinner?.start(space.id ? `Publishing to ${space.title || space.id}` : `Creating ${space.title} and publishing`);
     return publishSession({
@@ -197,6 +315,10 @@ async function publishOwned(context) {
       spaceTitle: space.id ? undefined : space.title,
       teamId: space.id ? undefined : teamId || parsed.options.team,
       access: space.id ? undefined : "private",
+      visibility,
+      indexFiles: listed ? sessionIndexFiles(listed, { spaceTitle: space.title, root }) : [],
+      rootIndex: root,
+      publicIndex: listed ? listed.some((session) => session.visibility === "public") : undefined,
       accessToken: auth.accessToken,
       fetchImpl,
     }).then(
@@ -242,6 +364,9 @@ async function publishOwned(context) {
       warn(`Your saved Space "${target.title || target.id}" is gone or no longer yours. Pick a new home.`);
       target = await pickSpace({ api, prompts, message: "Where should your sessions live now?" });
       saveTarget = true;
+      ({ list: sessions, root, bundle } = await place(target));
+      // What the session had in the old Space says nothing about this one.
+      if (!chosen) visibility = sessions?.find((session) => session.path === bundle.basePath)?.visibility || "private";
     }
   }
 
@@ -254,14 +379,14 @@ async function publishOwned(context) {
 
 async function pickSpace({ api, prompts, message }) {
   const spaces = await listSpaces(api);
-  const options = [
-    { value: NEW_SPACE, label: `New Space · ${OWNED_SPACE_TITLE}`, hint: "private to your team" },
-    ...spaces.map((space) => ({
-      value: space.id,
-      label: space.title || space.slug,
-      hint: [space.teamSlug, hostOf(space.liveUrl) || space.slug].filter(Boolean).join(" · "),
-    })),
-  ];
+  const newSpace = { value: NEW_SPACE, label: `New Space · ${OWNED_SPACE_TITLE}`, hint: "private to your team" };
+  const existing = spaces.map((space) => ({
+    value: space.id,
+    label: space.title || space.slug,
+    hint: [space.teamSlug, hostOf(space.liveUrl) || space.slug].filter(Boolean).join(" · "),
+  }));
+  // If an "AI sessions" Space already exists, offer it before making another one with the same name.
+  const options = spaces.some((space) => space.title === OWNED_SPACE_TITLE) ? [...existing, newSpace] : [newSpace, ...existing];
   const choose = options.length > AUTOCOMPLETE_AFTER ? prompts.autocomplete : prompts.select;
   const value = await choose({
     message,
@@ -302,6 +427,15 @@ async function publishAnonymous(context) {
     accessToken: publishAccessToken,
     claimToken,
     fetchImpl: dependencies.fetchImpl,
+    // A claimed Space's key is exchanged once, so its credential is saved before anything else can fail.
+    onCredential: (exchanged) => {
+      if (!configReadable || spaceId !== config.space?.id) return;
+      try {
+        rememberPublishResult(config, state, { credential: { accessToken: exchanged }, space: config.space }, env);
+      } catch (error) {
+        warn(`${error.message} The saved session space's new credential could not be saved.`);
+      }
+    },
   });
   let result;
   try {
@@ -337,12 +471,22 @@ async function publishAnonymous(context) {
   return result;
 }
 
+const ACCESS_LABELS = {
+  private: "Private, opens with the link",
+  public: "Public, open to everyone",
+};
+
+function nothingPublished(prompts) {
+  prompts.cancel("Nothing published.");
+  return null;
+}
+
 export function formatShareLinks(output) {
   const fields = [
     output.title && ["Session", output.title],
     ["Link", output.url || "Published"],
+    ACCESS_LABELS[output.visibility] && ["Access", ACCESS_LABELS[output.visibility]],
     (output.spaceTitle || output.spaceId) && ["Space", output.spaceTitle || output.spaceId],
-    output.versionUrl && ["Version", output.versionUrl],
     output.claimUrl && ["Claim", output.claimUrl],
     output.claimExpiresAt && ["Expires", formatDate(output.claimExpiresAt)],
   ].filter(Boolean);
@@ -359,7 +503,7 @@ function canReplaceSavedSpace(error) {
   return error?.stage === "initial_publish" && [401, 403, 404].includes(error?.status);
 }
 
-async function selectAgentAndSession({ requestedAgent, requestedSession, interactive, limit, availableAdapters, prompts, warn }) {
+async function selectAgentAndSession({ requestedAgent, requestedSession, interactive, limit, web, availableAdapters, prompts, warn }) {
   const adapter = requestedAgent ? findAdapter(requestedAgent, availableAdapters) : null;
   if (requestedAgent && !adapter) {
     throw new Error(`Unknown agent "${requestedAgent}". Try one of: ${availableAdapters.map((item) => item.id).join(", ")}.`);
@@ -382,50 +526,75 @@ async function selectAgentAndSession({ requestedAgent, requestedSession, interac
     return resolveSession(sessions, requestedSession);
   }
   if (!interactive) throw new Error(`Pass a session ID when there's no terminal to ask in: npx push-session ${adapter.id} <session-id>`);
-  let page = 0;
-  let search = "";
-  while (true) {
-    const matches = sessions.filter((entry) => matchesOption(search, {
-      search: [entry.session.title, entry.session.project, entry.session.id, entry.adapter.label, entry.adapter.id].filter(Boolean).join(" "),
-    }));
-    const pageCount = Math.max(1, Math.ceil(matches.length / limit));
-    const visible = matches.slice(page * limit, (page + 1) * limit);
-    const options = visible.map((entry, index) => ({
-      value: index,
-      label: entry.session.title,
-      hint: [
-        adapter ? null : entry.adapter.label,
-        relativeDate(entry.session.updatedAt || entry.session.createdAt),
-        shortProject(entry.session.project),
-        shortId(entry.session.id),
-      ].filter(Boolean).join(" · "),
-      search: [entry.session.title, entry.session.project, entry.session.id, entry.adapter.label, entry.adapter.id].filter(Boolean).join(" "),
-    }));
-    if (page > 0) options.push({ value: "previous", label: "← Previous page" });
-    if (page + 1 < pageCount) options.push({ value: "next", label: "Next page →" });
-    options.push({ value: "search", label: "Search all sessions…" });
-    if (search) options.push({ value: "clear", label: "Clear search" });
-    const message = adapter ? `Which ${adapter.label} session?` : "Which session do you want to share?";
-    const value = await prompts.autocomplete({
-      message: `${message} (${matches.length} sessions, page ${page + 1}/${pageCount})`,
-      placeholder: "Filter this page, or choose Search all sessions",
+  // Every session is in the list, so typing searches all of them and the arrows scroll through all of them.
+  const agents = [...new Map(sessions.map((entry) => [entry.adapter.id, entry.adapter])).values()];
+  // The real logos where the terminal can draw images; text marks everywhere else.
+  const logos = adapter ? null : await drawAgentLogos({ agents: agents.map((agent) => agent.id) });
+  const markOf = (agent) => logos?.mark(agent.id) || agentMark(agent);
+  const options = sessions.map((entry, index) => ({
+    // Numbered from 1: the prompt library ignores an initial value of 0.
+    value: index + 1,
+    agent: entry.adapter.id,
+    // With several agents in one list, each row starts with its agent's mark.
+    label: adapter ? entry.session.title : `${markOf(entry.adapter)} ${entry.session.title}`,
+    hint: [
+      relativeDate(entry.session.updatedAt || entry.session.createdAt),
+      shortProject(entry.session.project),
+      shortId(entry.session.id),
+    ].filter(Boolean).join(" · "),
+    search: [entry.session.title, entry.session.project, entry.session.id, entry.adapter.label, entry.adapter.id].filter(Boolean).join(" "),
+  }));
+  const question = adapter ? `Which ${adapter.label} session?` : "Which session do you want to share?";
+  const message = (count) => `${question} (${count} session${count === 1 ? "" : "s"})`;
+  let value;
+  if (prompts === clack) {
+    // In a real terminal the list also takes Tab, to switch which agent's sessions are shown.
+    value = await pickSession({
+      message,
       options,
-      filter: (search, option) => typeof option.value === "string" || matchesOption(search, option),
-      maxItems: 12,
+      agents: adapter ? [] : agents.map((agent) => ({ id: agent.id, label: agent.label, mark: markOf(agent) })),
+      filter: matchesOption,
+      maxItems: limit,
+      web,
+    });
+    if (value === OPEN_WEB) return { web: true };
+    if (value === null) {
+      prompts.cancel("Nothing published.");
+      process.exit(0);
+    }
+  } else {
+    value = await prompts.autocomplete({
+      message: message(options.length),
+      placeholder: "Type to search by title, project, agent, or ID",
+      options,
+      initialValue: 1,
+      filter: matchesOption,
+      maxItems: limit,
     });
     cancelIfNeeded(prompts, value);
-    if (value === "previous") page -= 1;
-    else if (value === "next") page += 1;
-    else if (value === "search") {
-      const query = await prompts.text({ message: "Search by title, project, agent, or ID", initialValue: search });
-      cancelIfNeeded(prompts, query);
-      search = String(query || "").trim();
-      page = 0;
-    } else if (value === "clear") {
-      search = "";
-      page = 0;
-    } else return visible[value];
   }
+  return sessions[value - 1];
+}
+
+// For terminals that cannot draw the logos, each agent gets the nearest glyph in its brand colour,
+// two cells wide: Claude's spark, OpenAI's blossom, Cursor's hexagon, Gemini's star, T3, and Pi's own
+// text mark, a coral P and a yellow i.
+const AGENT_MARKS = {
+  claude: { glyph: "✻", rgb: [217, 119, 87] },
+  codex: { glyph: "❋" },
+  cursor: { glyph: "⬢" },
+  gemini: { glyph: "✦", rgb: [71, 150, 227] },
+  pi: { parts: [["P", [228, 138, 122]], ["i", [234, 182, 93]]] },
+  t3: { glyph: "T3" },
+};
+
+function agentMark(agent) {
+  const mark = AGENT_MARKS[agent.id] || { glyph: "•" };
+  const colour = (text, rgb) => `\x1b[38;2;${rgb.join(";")}m${text}\x1b[39m`;
+  if (mark.parts) return mark.parts.map(([text, rgb]) => (pc.isColorSupported ? colour(text, rgb) : text)).join("");
+  const cell = mark.glyph.padEnd(2);
+  if (!pc.isColorSupported) return cell;
+  return mark.rgb ? `\x1b[38;2;${mark.rgb.join(";")}m${cell}\x1b[39m` : pc.bold(cell);
 }
 
 function matchesOption(search, option) {
@@ -483,9 +652,19 @@ function shortId(id) {
   return id.length > 12 ? id.slice(0, 8) : id;
 }
 
-function formatDate(value) {
+function formatDate(value, now = Date.now()) {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+  if (Number.isNaN(date.getTime())) return value;
+  const day = date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  const days = Math.round((date.getTime() - now) / 86_400_000);
+  if (days < 0) return day;
+  return `${day} (${days === 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`})`;
+}
+
+function redactionLine(count, enabled) {
+  if (!enabled) return "Secret masking is off (--no-redact)";
+  if (count === 0) return "No secrets found to mask";
+  return `Masked ${count} secret${count === 1 ? "" : "s"} (keys, tokens, passwords). --no-redact publishes them as written.`;
 }
 
 function printHelp() {
@@ -497,6 +676,7 @@ Usage
   npx push-session                       Pick any session from any agent
   npx push-session <agent>               Pick from one agent
   npx push-session <agent> <session-id>  Share that one, no questions
+  npx push-session web                   Pick sessions in a page on this machine
   npx push-session artifacts <list|export|publish>
 
 Agents
@@ -509,7 +689,8 @@ Agents
 
 Where sessions go
   Signed in (sf login or SPACEFAST_TOKEN): the first run asks which of your
-  Spaces gets your sessions and remembers it. Signed out: a claimable Space
+  Spaces gets your sessions and remembers it. The Space gets a sessions page:
+  your team sees every session there, everyone else only the public ones. Signed out: a claimable Space
   that lives on this machine until you claim it.
 
 Options
@@ -517,7 +698,10 @@ Options
   --space <id>   Publish to this Space once; your default stays put
   --new-space    Start a fresh "${OWNED_SPACE_TITLE}" Space and make it the default
   --team <slug>  Team for a new Space, if you're in more than one
-  --limit <n>    Sessions per picker page (default: 50)
+  --limit <n>    Sessions shown at a time in the picker (default: 12)
+  --private      Only your team and people with the share link (the default)
+  --public       Anyone can open the session, no link needed
+  --no-redact    Publish keys, tokens and passwords as written instead of masking them
   --dry-run      Render everything, upload nothing
   --json         Print one machine-readable result
   --api-url      Override the Spacefast API origin
