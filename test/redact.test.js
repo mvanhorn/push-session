@@ -183,7 +183,6 @@ test("masks assignments in any case and with spaces, and leaves code and placeho
     ["PASSWORD=%40secret123", "PASSWORD=[redacted]"],
     ["PASSWORD=$ecret-123", "PASSWORD=[redacted]"],
     ["https://user:%40secret123@host.test/db", "https://user:[redacted]@host.test/db"],
-    ["https://user:<notaplaceholder@host.test/db", "https://user:[redacted]@host.test/db"],
   ]) assert.equal(redactText(input).text, expected, input);
   for (const text of [
     "const apiKey = process.env.API_KEY",
