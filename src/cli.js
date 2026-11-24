@@ -36,6 +36,8 @@ const AUTOCOMPLETE_AFTER = 8;
 export async function run(argv = process.argv.slice(2), dependencies = {}) {
   if (argv[0] === "artifacts") return runArtifacts(argv.slice(1), dependencies);
   if (argv[0] === "web") {
+    if (argv.includes("-h") || argv.includes("--help")) return printHelp();
+    if (argv.includes("-v") || argv.includes("--version")) return console.log(packageVersion);
     // Each publish from the page is an ordinary non-interactive run for one session.
     const publish = (args) => run(args, { ...dependencies, interactive: false, log: () => {}, warn: () => {} });
     return runWeb(argv.slice(1), { publish, dependencies });
@@ -62,6 +64,8 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
     requestedSession: parsed.sessionId,
     interactive,
     limit: parsed.options.limit,
+    // The browser picker publishes for real, to the saved Space: not offered where that differs from what was asked.
+    web: !parsed.options.dryRun && !parsed.options.newSpace && !parsed.options.pickSpace,
     availableAdapters,
     prompts,
     warn,
@@ -182,9 +186,6 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
   const context = { parsed, config, configReadable, apiUrl, auth, env, interactive, prompts, warn, dependencies, selection, bundle, renderBundle, review };
   const result = auth ? await publishOwned(context) : await publishAnonymous(context);
 
-  if (result.publicSpace && result.visibility === "private") {
-    warn("This Space is public, so anyone can open this session, not only people with the link.");
-  }
   const output = {
     agent: selection.adapter.id,
     sessionId: selection.session.id,
@@ -226,7 +227,7 @@ async function publishOwned(context) {
   let unreadable = null;
   const loadIndex = async (space) => {
     unreadable = null;
-    if (!space.id) return [];
+    if (!space.id) return { sessions: [], rootTaken: false };
     try {
       return await loadSessionIndex(api, space.id, { first: context.bundle.basePath });
     } catch (error) {
@@ -270,16 +271,18 @@ async function publishOwned(context) {
   // public session cannot be found by guessing its ID.
   const legacyPath = context.bundle.basePath;
   const place = async (space) => {
-    const list = await loadIndex(space);
+    const index = await loadIndex(space);
+    const list = index && index.sessions;
     if (unreadable) {
       throw new Error(`Could not read this Space's session list (${unreadable.message}), so this session's address and who can open it are unknown. Nothing was published; try again.`);
     }
     const known = list?.find((entry) => (entry.sessionId === selection.session.id && entry.agent === selection.adapter.id) || entry.path === legacyPath);
-    return { list, bundle: renderBundle(known?.path || `sessions/${randomUUID()}`) };
+    return { list, root: !index?.rootTaken, bundle: renderBundle(known?.path || `sessions/${randomUUID()}`) };
   };
-  let { list: sessions, bundle } = await place(target);
+  let { list: sessions, root, bundle } = await place(target);
   const saved = sessions?.find((session) => session.path === bundle.basePath)?.visibility;
   let visibility = parsed.options.visibility;
+  let chosen = Boolean(visibility);
   if (!visibility && review) {
     visibility = await prompts.select({
       message: "Who can open this session?",
@@ -290,6 +293,7 @@ async function publishOwned(context) {
       ],
     });
     cancelIfNeeded(prompts, visibility);
+    chosen = true;
   }
   // Republishing without a flag keeps what the session already had.
   visibility ||= saved || "private";
@@ -312,7 +316,8 @@ async function publishOwned(context) {
       teamId: space.id ? undefined : teamId || parsed.options.team,
       access: space.id ? undefined : "private",
       visibility,
-      indexFiles: listed ? sessionIndexFiles(listed, { spaceTitle: space.title }) : [],
+      indexFiles: listed ? sessionIndexFiles(listed, { spaceTitle: space.title, root }) : [],
+      rootIndex: root,
       publicIndex: listed ? listed.some((session) => session.visibility === "public") : undefined,
       accessToken: auth.accessToken,
       fetchImpl,
@@ -359,7 +364,9 @@ async function publishOwned(context) {
       warn(`Your saved Space "${target.title || target.id}" is gone or no longer yours. Pick a new home.`);
       target = await pickSpace({ api, prompts, message: "Where should your sessions live now?" });
       saveTarget = true;
-      ({ list: sessions, bundle } = await place(target));
+      ({ list: sessions, root, bundle } = await place(target));
+      // What the session had in the old Space says nothing about this one.
+      if (!chosen) visibility = sessions?.find((session) => session.path === bundle.basePath)?.visibility || "private";
     }
   }
 
@@ -487,7 +494,7 @@ function canReplaceSavedSpace(error) {
   return error?.stage === "initial_publish" && [401, 403, 404].includes(error?.status);
 }
 
-async function selectAgentAndSession({ requestedAgent, requestedSession, interactive, limit, availableAdapters, prompts, warn }) {
+async function selectAgentAndSession({ requestedAgent, requestedSession, interactive, limit, web, availableAdapters, prompts, warn }) {
   const adapter = requestedAgent ? findAdapter(requestedAgent, availableAdapters) : null;
   if (requestedAgent && !adapter) {
     throw new Error(`Unknown agent "${requestedAgent}". Try one of: ${availableAdapters.map((item) => item.id).join(", ")}.`);
@@ -539,7 +546,7 @@ async function selectAgentAndSession({ requestedAgent, requestedSession, interac
       agents: adapter ? [] : agents.map((agent) => ({ id: agent.id, label: agent.label, mark: markOf(agent) })),
       filter: matchesOption,
       maxItems: limit,
-      web: true,
+      web,
     });
     if (value === OPEN_WEB) return { web: true };
     if (value === null) {

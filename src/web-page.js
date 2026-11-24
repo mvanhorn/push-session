@@ -17,6 +17,7 @@ body{margin:0;min-width:320px;background:var(--background);color:var(--foregroun
 main{max-width:820px;margin:0 auto;padding:40px 24px 140px}
 h1{margin:0;font-size:24px;letter-spacing:-.02em}
 .status{margin:4px 0 0;color:var(--muted);font-size:13px}
+.status button{padding:2px 8px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--foreground);font:inherit;cursor:pointer}
 .filters{position:sticky;top:0;z-index:3;display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:20px;padding:10px 0;background:var(--background)}
 input[type=search]{min-width:0;flex:1 1 220px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:transparent;color:inherit;font:inherit;font-size:14px}
 :focus-visible{outline:2px solid var(--foreground);outline-offset:1px}
@@ -119,9 +120,21 @@ li input{width:16px;height:16px;margin:3px 0 0;flex:none;accent-color:var(--fore
     return new Date(time).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   };
 
-  const [status, listing] = await Promise.all([api("/api/status"), api("/api/sessions")]);
-  const sessions = listing.sessions || [];
   const statusLine = document.getElementById("status");
+  let status;
+  let listing;
+  try {
+    [status, listing] = await Promise.all([api("/api/status"), api("/api/sessions")]);
+    if (!Array.isArray(listing.sessions)) throw new Error(listing.error || "No session list came back.");
+  } catch (error) {
+    // Usually the command was stopped; say so and offer another try instead of loading forever.
+    const retry = element("button", "", "Try again");
+    retry.type = "button";
+    retry.addEventListener("click", () => location.reload());
+    statusLine.replaceChildren("Could not reach push-session web (" + error.message + "). Is it still running? ", retry);
+    return;
+  }
+  const sessions = listing.sessions;
   statusLine.textContent = sessions.length + " session" + (sessions.length === 1 ? "" : "s") + " on this machine · "
     + (status.signedIn ? "publishing to " + (status.space || "your AI sessions Space") : "not signed in: sessions go to a claimable Space, private only");
 

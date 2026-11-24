@@ -65,9 +65,13 @@ Space with it. Signed in, a session's address is a random ID, not the agent's
 session ID, so a public session cannot be found by guessing. Publishing a session again without a flag keeps what it had; a
 flag changes it. Signed out, sessions are always private.
 
-The Space also gets a sessions page at its root. Your team sees every session
-there. Everyone else sees only the public ones, and nothing at all while no
-session is public.
+The Space also gets a sessions page at its root, and at `/sessions/`. Your team
+sees every session there. Everyone else sees only the public ones, and nothing at
+all while no session is public. A Space that already has its own home page keeps
+it: the sessions page is then at `/sessions/` only.
+
+A private session cannot go into a Space that is public as a whole, since anyone
+could open it there. Publish it with `--public`, or pick a private Space.
 
 > Sessions can contain code, file paths, commands, and secrets. Review before
 > sharing. Anyone with the link can read it.

@@ -121,7 +121,10 @@ function parseWebArgs(argv) {
   }
   // The rest are the usual publishing options (--team, --space, --no-redact, ...), checked now, not on the first publish.
   const parsed = parseArgs(forwarded, {});
-  if (parsed.agent || parsed.options.json || parsed.options.dryRun || parsed.options.visibility) {
+  const { options } = parsed;
+  // Each publish from the page runs without a terminal, so options that ask a question, make a new
+  // Space every time, or publish nothing have no meaning here.
+  if (parsed.agent || options.json || options.dryRun || options.visibility || options.newSpace || options.pickSpace) {
     throw new Error("push-session web takes publishing options such as --team, --space and --no-redact; sessions and who can open them are chosen in the page.");
   }
   return { port, open, forwarded };

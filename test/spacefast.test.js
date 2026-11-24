@@ -280,7 +280,7 @@ test("republishing into a Space reuses the session's existing share link", async
     target: { kind: "live" },
     ...overrides,
   });
-  const publishWith = async (links) => {
+  const publishWith = async (links, credential = { accessToken: "token" }) => {
     const requests = [];
     const fetchImpl = async (url, init = {}) => {
       requests.push({ url: String(url), method: init.method || "GET" });
@@ -288,7 +288,7 @@ test("republishing into a Space reuses the session's existing share link", async
       if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { id: "lnk_new", url: "https://sessions.example/__/new" } });
       return jsonResponse(201, { data: { space: { id: "spc_saved" }, next: { action: "done" } } });
     };
-    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", accessToken: "token" });
+    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", ...credential });
     return { result, created: requests.some((request) => request.url.endsWith("/share-links")) };
   };
 
@@ -298,11 +298,16 @@ test("republishing into a Space reuses the session's existing share link", async
 
   const editorLink = link("/sessions/one", { capabilities: ["page.view", "comments.write"] });
   const expiring = link("/sessions/one", { constraints: { expiresAt: "2030-01-01T00:00:00Z" } });
-  for (const links of [[link("/sessions/other")], [editorLink, expiring], null]) {
+  for (const links of [[link("/sessions/other")], [editorLink, expiring]]) {
     const fresh = await publishWith(links);
     assert.equal(fresh.result.shareUrl, "https://sessions.example/__/new");
     assert.equal(fresh.created, true);
   }
+
+  // An unread access list could hide a public grant, so a signed-in publish stops. Signed out there is none to hide.
+  await assert.rejects(publishWith(null), { status: 403 });
+  const signedOut = await publishWith(null, { claimToken: "claim" });
+  assert.equal(signedOut.result.shareUrl, "https://sessions.example/__/new");
 });
 
 test("public and private sessions adjust the Space's access instead of making a share link", async () => {
@@ -341,10 +346,17 @@ test("public and private sessions adjust the Space's access instead of making a 
   assert.deepEqual(linked.calls, ["revoke grt_public", "upload"], "the index grant is left alone when the index was not rebuilt");
   assert.equal(linked.result.shareUrl, "https://sessions.example/__/old");
 
-  // A public Space opens every session; the caller is told so it can warn.
+  // A public Space opens every session, so a private publish stops before anything is uploaded.
   const wholeSpace = [grant("grt_all", "public", ["/**"])];
-  assert.equal((await publishWith(wholeSpace, { visibility: "private" })).result.publicSpace, true);
+  await assert.rejects(publishWith(wholeSpace, { visibility: "private" }), /This Space is public/);
+  assert.equal((await publishWith(wholeSpace, { visibility: "public" })).result.publicSpace, true);
   assert.equal((await publishWith([grant("grt_other", "public", ["/sessions/two/**"])], { visibility: "private" })).result.publicSpace, false);
+
+  // In a Space whose home page is its own, the sessions page is public under /sessions/ only.
+  const sessionsOnly = ["/sessions", "/sessions/index.html", "/sessions/public.json"];
+  assert.deepEqual((await publishWith([], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["upload", "grant public /sessions/one", "grant public /sessions"]);
+  assert.deepEqual((await publishWith([grant("grt_public", "public", session), grant("grt_index", "public", index)], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["revoke grt_index", "upload", "grant public /sessions"], "a grant on the home page is withdrawn");
+  assert.deepEqual((await publishWith([grant("grt_public", "public", session), grant("grt_index", "public", sessionsOnly)], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["upload"]);
 
   await assert.rejects(publishSession({ fetchImpl: async () => { throw new Error("no request expected"); }, session: { id: "one" }, html: "ok", visibility: "public" }), /need you signed in/);
 });

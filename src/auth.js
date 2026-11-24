@@ -84,13 +84,10 @@ function readPlaintext(env) {
   return fs.readFileSync(authPath, "utf8");
 }
 
+// A stored login that is not JSON is damaged, not absent: it throws, so the caller hears "unreadable".
 function parseStoredAuth(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.accessToken === "string" ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = JSON.parse(raw);
+  return typeof parsed?.accessToken === "string" ? parsed : null;
 }
 
 function platformKeyring(env, platform) {

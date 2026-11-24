@@ -67,3 +67,15 @@ test("masks recovered source files, refreshes their size and hash, and drops an 
   assert.equal(clean.source.files[0].sha256, "stale");
   assert.notEqual(clean.source.archive, null);
 });
+
+test("masks bare credential names and Authorization headers", () => {
+  const cases = [
+    ["PASSWORD=hunter2hunter2", "PASSWORD=[redacted]"],
+    ["TOKEN=abcdefgh12345678 next", "TOKEN=[redacted] next"],
+    ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345", "Authorization: Bearer [redacted]"],
+    ["curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZDEyMzQ1Ng=='", "curl -H 'Authorization: Basic [redacted]'"],
+  ];
+  for (const [input, expected] of cases) assert.equal(redactText(input).text, expected);
+  assert.equal(redactDeep([{ input: { Authorization: "Bearer abcdefghijklmnopqrstuvwxyz012345" } }]).value[0].input.Authorization, "Bearer [redacted]");
+  for (const plain of ["Bearer authentication is required", "Basic usage of the tool"]) assert.equal(redactText(plain).count, 0);
+});

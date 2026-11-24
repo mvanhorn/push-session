@@ -46,7 +46,9 @@ export function createCursorAdapter(options = {}) {
       const messages = [];
       for (const entry of readJsonLines(session.filePath)) {
         if (entry.role !== "user" && entry.role !== "assistant") continue;
-        const content = cleanCursorText(extractCursorText(entry.message?.content));
+        const text = extractCursorText(entry.message?.content);
+        // Only a user turn is wrapped in <user_query>; an assistant may quote the tag in its answer.
+        const content = entry.role === "user" ? cleanCursorText(text) : text.trim();
         if (content && !isBootstrapMessage(content)) messages.push({ role: entry.role, content, createdAt: entry.timestamp });
       }
       return messages;

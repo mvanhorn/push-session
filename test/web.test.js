@@ -77,3 +77,20 @@ test("the web command takes publishing options, not sessions", async () => {
   await assert.rejects(run(["web", "--no-open", "--public"], {}), /chosen in the page/);
   await assert.rejects(run(["web", "--port", "abc"], {}), /--port must be a number/);
 });
+
+test("the web command answers --help and --version itself, and refuses options a page cannot honour", async () => {
+  const printed = [];
+  const original = console.log;
+  console.log = (text) => printed.push(String(text));
+  try {
+    await run(["web", "--help"], {});
+    await run(["web", "--version"], {});
+  } finally {
+    console.log = original;
+  }
+  assert.match(printed[0], /npx push-session web/);
+  assert.match(printed[1], /^\d+\.\d+\.\d+/);
+  for (const flag of ["--dry-run", "--new-space", "--pick-space"]) {
+    await assert.rejects(run(["web", "--no-open", flag], {}), /chosen in the page/);
+  }
+});

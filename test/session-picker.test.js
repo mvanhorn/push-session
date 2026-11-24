@@ -74,3 +74,15 @@ test("Ctrl+X leaves the list for the picker in the browser", async () => {
   assert.equal(await picked, OPEN_WEB);
   assert.match(drawn(), /Opening the picker in your browser/);
 });
+
+test("Enter on a search with no matches keeps the list open", async () => {
+  const { input, output, drawn, press } = terminal();
+  const picked = pickSession({ message, options, agents, filter, maxItems: 10, input, output });
+  await press("zzz");
+  drawn();
+  await press("\r");
+  assert.match(drawn(), /No session matches that search\./);
+  await press("\x7f\x7f\x7f");
+  await press("\r");
+  assert.equal(await picked, 1);
+});

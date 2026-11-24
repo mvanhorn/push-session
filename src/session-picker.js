@@ -21,6 +21,8 @@ export async function pickSession({ message, options, agents = [], filter, maxIt
     options: shown,
     filter,
     initialValue: options.length > 0 ? [options[0].value] : undefined,
+    // Enter on a search with no matches has nothing to submit.
+    validate: (value) => (value === undefined ? "No session matches that search." : undefined),
     input,
     output,
     render() {
@@ -39,7 +41,8 @@ export async function pickSession({ message, options, agents = [], filter, maxIt
       const typed = this.userInput ? this.userInputWithCursor : pc.dim("Type to search by title, project, agent, or ID");
       const matches = this.filteredOptions.length === shown().length ? "" : pc.dim(` (${this.filteredOptions.length} match${this.filteredOptions.length === 1 ? "" : "es"})`);
       const head = [bar, title, guide.trimEnd(), `${guide}${pc.dim("Search:")} ${typed}${matches}`];
-      if (this.filteredOptions.length === 0 && this.userInput) head.push(`${guide}${pc.yellow("No matches found")}`);
+      if (this.state === "error") head.push(`${guide}${pc.yellow(this.error)}`);
+      else if (this.filteredOptions.length === 0 && this.userInput) head.push(`${guide}${pc.yellow("No matches found")}`);
 
       const agent = only === null ? "all" : `${agents[only].mark} ${agents[only].label}`;
       const foot = [

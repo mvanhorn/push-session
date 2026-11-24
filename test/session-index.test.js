@@ -68,7 +68,8 @@ test("reads the Space's session list and recovers sessions published before the 
     }
     return new Response(stored[target.pathname.slice(1)]);
   };
-  const sessions = await loadSessionIndex({ fetchImpl, accessToken: "token" }, "spc_one");
+  const { sessions, rootTaken } = await loadSessionIndex({ fetchImpl, accessToken: "token" }, "spc_one");
+  assert.equal(rootTaken, false);
   assert.deepEqual(sessions.map((session) => [session.path, session.title, session.visibility]), [
     ["sessions/1", "Session 1", "public"],
     ["sessions/2", "Session 2", "private"],
@@ -126,7 +127,28 @@ test("the session being published is recovered first when a Space has more old s
     if (target.pathname.endsWith("/access")) return json({ data: [] });
     return new Response(shell(target.pathname.split("/")[2]));
   };
-  const sessions = await loadSessionIndex({ fetchImpl, accessToken: "token" }, "spc_one", { first: "sessions/old-59" });
+  const { sessions } = await loadSessionIndex({ fetchImpl, accessToken: "token" }, "spc_one", { first: "sessions/old-59" });
   assert.equal(sessions.length, 50);
   assert.ok(sessions.some((session) => session.path === "sessions/old-59"), "so it is republished at its old address");
+});
+
+test("a Space's own home page is left alone; ours is recognised and replaced", async () => {
+  const ours = sessionIndexFiles([entry(1, "public")]);
+  assert.deepEqual(ours.map((file) => file.path), ["index.html", "sessions/index.html", "sessions/team.html", "sessions/index.json", "sessions/public.json"]);
+  const elsewhere = sessionIndexFiles([entry(1, "public")], { root: false });
+  assert.deepEqual(elsewhere.map((file) => file.path), ["sessions/index.html", "sessions/team.html", "sessions/index.json", "sessions/public.json"]);
+  assert.match(elsewhere[1].content, /url=\/sessions\//, "signing in returns to the sessions page, not the Space's home page");
+
+  const load = (home) => loadSessionIndex({
+    accessToken: "token",
+    fetchImpl: async (url) => {
+      const target = new URL(url);
+      if (target.pathname.endsWith("/files")) return json({ data: { versionId: "ver_1", files: home === null ? [] : [{ path: "index.html" }] } });
+      if (target.pathname.endsWith("/files/links")) return json({ data: { links: { "index.html": { url: "https://files.example/index.html" } } } });
+      return new Response(home);
+    },
+  }, "spc_one");
+  assert.equal((await load("<h1>My site</h1>")).rootTaken, true);
+  assert.equal((await load(ours[0].content)).rootTaken, false);
+  assert.equal((await load(null)).rootTaken, false);
 });

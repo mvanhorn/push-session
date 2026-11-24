@@ -200,7 +200,7 @@ test("uses Cursor workspace metadata and message timestamps when available", (co
   writeJsonl(path.join(transcriptDir, `${id}.jsonl`), [
     { role: "user", timestamp: 1_786_622_400, message: { content: [{ type: "text", text: "<environment_context>generated</environment_context>" }] } },
     { role: "user", timestamp: 1_786_622_460, message: { content: [{ type: "text", text: "<manually_attached_skills>\nThe user attached a skill.\n</manually_attached_skills>\n<timestamp>Tuesday, Sep 22, 2026, 10:21 PM (UTC+2)</timestamp>\n<user_query>\nFix the parser\n</user_query>" }] } },
-    { role: "assistant", timestamp: 1_786_622_520, message: { content: [{ type: "text", text: "Done." }] } },
+    { role: "assistant", timestamp: 1_786_622_520, message: { content: [{ type: "text", text: "Done. Wrap it as <user_query>Fix the parser</user_query> next time." }] } },
   ]);
 
   const adapter = createCursorAdapter({ home });
@@ -209,7 +209,7 @@ test("uses Cursor workspace metadata and message timestamps when available", (co
   assert.equal(session.project, "/work/exact-cursor-project");
   assert.equal(session.createdAt, 1_786_622_400_000);
   assert.equal(session.updatedAt, 1_786_622_520_000);
-  assert.deepEqual(adapter.load(session).map((message) => message.content), ["Fix the parser", "Done."]);
+  assert.deepEqual(adapter.load(session).map((message) => message.content), ["Fix the parser", "Done. Wrap it as <user_query>Fix the parser</user_query> next time."]);
 });
 
 test("discovers Pi sessions and renders only the active branch", (context) => {

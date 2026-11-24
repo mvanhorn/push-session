@@ -10,8 +10,10 @@ const PATTERNS = [
   /()\bsk-[A-Za-z0-9_-]{20,}/g,
   /()\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g,
   /()\bxox[abeprs]-[A-Za-z0-9-]{10,}/g,
+  // Authorization headers: the scheme stays, the credential goes.
+  /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g,
   // Environment-style NAME_KEY=value assignments; the name stays readable.
-  /(\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\?["']?)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\?["']?)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
   // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
   // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
   /(["'][A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd)[A-Za-z0-9_-]*\\?["']\s*:\s*\\?["'])(?!\[redacted\])(?=[^\s"'\\]*[\d_+/=.-])[^\s"'\\]{8,}(?=\\?["'])/gi,

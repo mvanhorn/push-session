@@ -156,7 +156,10 @@ function openInLink(agent, session, items, url) {
 function SessionActions({ session, pages }) {
   const loadItems = useWholeSession(pages);
   const [copyState, setCopyState] = useState("idle");
-  const [items, setItems] = useState(null);
+  // What Open in works from: the whole transcript, or nothing yet if loading it failed.
+  const [transcript, setTranscript] = useState(null);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const items = transcript ? transcript.items : null;
   const menu = useRef(null);
   const pageUrl = () => `${window.location.origin}${window.location.pathname}`;
 
@@ -170,12 +173,13 @@ function SessionActions({ session, pages }) {
     window.setTimeout(() => setCopyState("idle"), 2_000);
   };
   const prepare = async (event) => {
-    if (!event.currentTarget.open || items) return;
+    // A load that failed is tried again each time the menu opens.
+    if (!event.currentTarget.open || (transcript && !transcript.failed)) return;
     try {
-      setItems(await loadItems());
+      setTranscript({ items: await loadItems(), failed: false });
     } catch {
-      // Without the transcript the link still names the page.
-      setItems([]);
+      // Without the transcript the links still name the page.
+      setTranscript({ items: [], failed: true });
     }
   };
   useEffect(() => {
@@ -209,9 +213,19 @@ function SessionActions({ session, pages }) {
               key={agent.id}
               href={href}
               aria-disabled={href ? undefined : "true"}
-              onClick={() => {
-                // A session too long for the link travels by clipboard, as the prompt says.
-                if (partial) void copyText(sessionMarkdown(session, items)).catch(() => {});
+              onClick={async (event) => {
+                // A session too long for the link travels by clipboard, as the prompt says, so the agent
+                // opens only once the copy has worked. After a failed copy, a second press opens it anyway.
+                if (partial && !copyFailed) {
+                  event.preventDefault();
+                  try {
+                    await copyText(sessionMarkdown(session, items));
+                  } catch {
+                    setCopyFailed(true);
+                    return;
+                  }
+                  window.location.href = href;
+                }
                 menu.current.open = false;
               }}
             >
@@ -219,7 +233,9 @@ function SessionActions({ session, pages }) {
               <span>{agent.label}</span>
             </a>
           ))}
-          {links.some((link) => link.partial) ? <p>Too long for a link: the full transcript is also copied, ready to paste.</p> : null}
+          {transcript?.failed ? <p>Could not load the transcript, so these links carry only the page address. Reopen this menu to try again.</p>
+            : copyFailed ? <p>Could not copy the transcript. Choose the agent again to open it with the ending only.</p>
+              : links.some((link) => link.partial) ? <p>Too long for a link: the full transcript is also copied, ready to paste.</p> : null}
         </div>
       </details>
     </div>
@@ -258,6 +274,8 @@ function MessageRail({ messages }) {
   const [preview, setPreview] = useState(null);
   const [listOpen, setListOpen] = useState(false);
   const currentItem = useRef(null);
+  const sheet = useRef(null);
+  const opener = useRef(null);
   const activeRef = useRef(0);
   activeRef.current = active;
 
@@ -300,12 +318,27 @@ function MessageRail({ messages }) {
     };
   }, [entries, jump]);
 
+  // While the list is open it holds the keyboard: focus starts on the current message, Tab stays
+  // inside, Escape closes, and closing hands focus back to the button that opened it.
   useEffect(() => {
     if (!listOpen) return undefined;
+    const from = opener.current;
     currentItem.current?.scrollIntoView?.({ block: "center" });
-    const onKey = (event) => { if (event.key === "Escape") setListOpen(false); };
+    currentItem.current?.focus?.({ preventScroll: true });
+    const onKey = (event) => {
+      if (event.key === "Escape") setListOpen(false);
+      if (event.key !== "Tab" || !sheet.current) return;
+      const stops = [...sheet.current.querySelectorAll("button")];
+      const inside = sheet.current.contains(document.activeElement);
+      if (inside && document.activeElement !== (event.shiftKey ? stops[0] : stops.at(-1))) return;
+      event.preventDefault();
+      (event.shiftKey ? stops.at(-1) : stops[0])?.focus();
+    };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      from?.focus?.();
+    };
   }, [listOpen]);
 
   if (entries.length < 2) return null;
@@ -381,11 +414,11 @@ function MessageRail({ messages }) {
       ) : null}
     </nav>
     {/* Where there is no room for the rail, the same messages open as a list from a button. */}
-    <button className="rail-open" type="button" aria-haspopup="dialog" aria-expanded={listOpen} onClick={() => setListOpen(true)}>
+    <button className="rail-open" type="button" ref={opener} aria-haspopup="dialog" aria-expanded={listOpen} onClick={() => setListOpen(true)}>
       <Icon name="message" />{active + 1} / {entries.length}
     </button>
     {listOpen ? (
-      <div className="rail-sheet" role="dialog" aria-label="Your messages" onClick={(event) => { if (event.target === event.currentTarget) setListOpen(false); }}>
+      <div className="rail-sheet" ref={sheet} role="dialog" aria-modal="true" aria-label="Your messages" onClick={(event) => { if (event.target === event.currentTarget) setListOpen(false); }}>
         <div className="rail-sheet-panel">
           <div className="rail-sheet-head">
             <strong>Your messages</strong>

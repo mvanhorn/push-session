@@ -7,15 +7,21 @@ import { listSpaceAccess, readSpaceFiles } from "./spacefast.js";
 export const INDEX_PATH = "sessions/index.json";
 export const PUBLIC_INDEX_PATH = "sessions/public.json";
 const TEAM_PATH = "sessions/team.html";
+const ROOT_PATH = "index.html";
+// Marks a page as written by push-session, so a Space's own home page is never taken for ours.
+const GENERATOR = '<meta name="generator" content="push-session">';
 const MAX_BACKFILL = 50;
 
 /**
- * The sessions a Space already lists. Sessions published before the index existed are recovered
- * from their own pages, at most 50 at a time. Throws when the Space cannot be read, so a failed read never becomes an
- * index that forgets sessions.
+ * The sessions a Space already lists, and whether its home page belongs to something else.
+ * Sessions published before the index existed are recovered from their own pages, at most 50 at
+ * a time. Throws when the Space cannot be read, so a failed read never becomes an index that
+ * forgets sessions.
  */
 export async function loadSessionIndex(api, spaceId, { first } = {}) {
-  const { paths, contents } = await readSpaceFiles({ ...api, spaceId, select: (all) => all.filter((file) => file === INDEX_PATH) });
+  const { paths, contents } = await readSpaceFiles({ ...api, spaceId, select: (all) => all.filter((file) => file === INDEX_PATH || file === ROOT_PATH) });
+  // A home page that is not ours is the Space's own site: the sessions page then lives under /sessions/ only.
+  const rootTaken = contents.has(ROOT_PATH) && !contents.get(ROOT_PATH).includes(GENERATOR);
   const parsed = contents.has(INDEX_PATH) ? JSON.parse(contents.get(INDEX_PATH)) : null;
   // Anything that is not public is private; older lists also had a link-only state, which private now covers.
   const sessions = (Array.isArray(parsed?.sessions) ? parsed.sessions : [])
@@ -28,7 +34,7 @@ export async function loadSessionIndex(api, spaceId, { first } = {}) {
     .filter((file) => /^sessions\/[^/]+\/index\.html$/.test(file) && !listed.has(path.posix.dirname(file)))
     .sort((left, right) => (path.posix.dirname(right) === first) - (path.posix.dirname(left) === first))
     .slice(0, MAX_BACKFILL);
-  if (unlisted.length === 0) return sessions;
+  if (unlisted.length === 0) return { sessions, rootTaken };
 
   const [pages, access] = await Promise.all([
     readSpaceFiles({ ...api, spaceId, select: () => unlisted }),
@@ -47,7 +53,7 @@ export async function loadSessionIndex(api, spaceId, { first } = {}) {
       visibility: visibilityOf(access, sessionPath),
     }));
   }
-  return sessions;
+  return { sessions, rootTaken };
 }
 
 export function indexEntry({ path: sessionPath, session, messages, publishedAt, visibility }) {
@@ -71,20 +77,21 @@ export function indexEntry({ path: sessionPath, session, messages, publishedAt, 
 }
 
 export function visibilityOf(access, sessionPath) {
-  const covers = (entry) => entry.resources?.include?.includes(`/${sessionPath}/**`);
+  const covers = (entry) => entry.resources?.include?.includes(`/${sessionPath}/**`)
+    && !entry.resources?.exclude?.includes(`/${sessionPath}/**`);
   return access.some((entry) => entry.subject?.audience === "public" && covers(entry)) ? "public" : "private";
 }
 
 /** The index pages and their two listings: everything for the team, public sessions for everyone else. */
-export function sessionIndexFiles(sessions, { spaceTitle } = {}) {
+export function sessionIndexFiles(sessions, { spaceTitle, root = true } = {}) {
   const sorted = [...sessions].sort((left, right) => String(right.updatedAt || right.publishedAt).localeCompare(String(left.updatedAt || left.publishedAt)));
   const listing = (entries) => JSON.stringify({ version: 1, sessions: entries });
   const html = renderIndexHtml(spaceTitle || "AI sessions");
   return [
-    { path: "index.html", content: html, contentType: "text/html; charset=utf-8" },
+    ...(root ? [{ path: ROOT_PATH, content: html, contentType: "text/html; charset=utf-8" }] : []),
     { path: "sessions/index.html", content: html, contentType: "text/html; charset=utf-8" },
     // Private on purpose: opening it makes Spacefast sign a team member in, then it returns to the list.
-    { path: TEAM_PATH, content: `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>${escapeHtml(spaceTitle || "AI sessions")}</title>`, contentType: "text/html; charset=utf-8" },
+    { path: TEAM_PATH, content: `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=${root ? "/" : "/sessions/"}"><title>${escapeHtml(spaceTitle || "AI sessions")}</title>`, contentType: "text/html; charset=utf-8" },
     { path: INDEX_PATH, content: listing(sorted), contentType: "application/json; charset=utf-8" },
     { path: PUBLIC_INDEX_PATH, content: listing(sorted.filter((session) => session.visibility === "public").map(({ sessionId: _private, ...entry }) => entry)), contentType: "application/json; charset=utf-8" },
   ];
@@ -97,6 +104,7 @@ function renderIndexHtml(spaceTitle) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+${GENERATOR}
 <meta name="robots" content="noindex,nofollow">
 <meta name="color-scheme" content="light dark">
 <title>${title}</title>

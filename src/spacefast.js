@@ -30,6 +30,7 @@ export async function publishSession(input) {
   // The Space's own index pages live outside the session folder and are never covered by its share link.
   files.push(...prepareFiles({ files: input.indexFiles || [] }));
   const visibility = input.visibility || "private";
+  const rootIndex = input.rootIndex !== false;
   if (visibility === "public" && !input.accessToken) {
     throw new Error("Public sessions need you signed in. Run `sf login` or set SPACEFAST_TOKEN.");
   }
@@ -50,7 +51,7 @@ export async function publishSession(input) {
   };
   const inline = totalFileBytes(files) <= (input.inlineLimitBytes ?? DEFAULT_INLINE_LIMIT);
   const priorAccess = requestedSpace && bearerToken
-    ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex })
+    ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: !input.accessToken })
     : NO_ACCESS;
   let initial;
   // Every attempt reuses the idempotency key, so retrying a publish cannot create a second one.
@@ -122,6 +123,7 @@ export async function publishSession(input) {
     basePath,
     visibility,
     publicIndex: input.publicIndex,
+    rootIndex,
     access: priorAccess,
     title: input.session?.title,
     shareName: input.shareName,
@@ -234,24 +236,28 @@ async function uploadTargets({ targets, files, apiUrl, fetchImpl }) {
   }
 }
 
-const INDEX_RESOURCES = ["/", "/index.html", "/sessions", "/sessions/index.html", "/sessions/public.json"];
-
 const NO_ACCESS = { links: [], publicGrants: [], indexGrants: [], publicSpace: false };
+
+// The sessions page is public while any session is. Its root copy is left out for a Space whose
+// home page is something else.
+function indexResources(rootIndex) {
+  return [...(rootIndex ? ["/", "/index.html"] : []), "/sessions", "/sessions/index.html", "/sessions/public.json"];
+}
 
 /**
  * Before anything is uploaded: reads the Space's access and takes away what the session's new
  * visibility does not allow, so new content never goes live under access that is about to end.
  * "private": the team plus anyone with the share link. "public": anyone.
  */
-async function restrictAccess({ api, basePath, visibility, publicIndex }) {
+async function restrictAccess({ api, basePath, visibility, publicIndex, rootIndex, tolerant }) {
   const resources = sessionResources(basePath);
   let entries;
   try {
     entries = await listSpaceAccess(api);
   } catch (error) {
-    // A private publish that leaves the index alone can go on without the listing: a fresh link is
-    // always correct. Anything else must not, or a public grant could be left behind or doubled.
-    if (visibility !== "private" || publicIndex !== undefined) throw error;
+    // Only a signed-out publish goes on without the listing: its Space has no public grants to
+    // leave behind, and a fresh link is always correct. Signed in, an unread listing could hide one.
+    if (!tolerant) throw error;
     return NO_ACCESS;
   }
   const scoped = (entry, include) => entry.target?.kind === "live"
@@ -261,28 +267,34 @@ async function restrictAccess({ api, basePath, visibility, publicIndex }) {
   const isPublic = (entry) => entry.subject?.audience === "public";
   let publicGrants = entries.filter((entry) => isPublic(entry) && scoped(entry, resources));
   const links = entries.filter((entry) => entry.subject?.audience === "link" && entry.subject.landingPath === resources[0] && scoped(entry, resources));
-  let indexGrants = entries.filter((entry) => isPublic(entry) && scoped(entry, INDEX_RESOURCES));
+  const wanted = indexResources(rootIndex);
+  const allIndexGrants = entries.filter((entry) => isPublic(entry) && [true, false].some((root) => scoped(entry, indexResources(root))));
   // A wider public grant, such as a public Space, opens the session whatever is set here.
   const publicSpace = entries.some((entry) => isPublic(entry) && !publicGrants.includes(entry)
     && (entry.resources?.include || []).some((pattern) => covers(pattern, resources[0]))
     && !(entry.resources.exclude || []).some((pattern) => covers(pattern, resources[0])));
+  if (publicSpace && visibility === "private") {
+    throw new Error("This Space is public, so a session in it is open to anyone. Publish with --public, or to a private Space (--pick-space or --space <id>).");
+  }
   if (visibility !== "public") {
     for (const entry of publicGrants) await revokeSpaceAccess(api, entry.id);
     publicGrants = [];
   }
-  if (publicIndex === false) {
-    for (const entry of indexGrants) await revokeSpaceAccess(api, entry.id);
-    indexGrants = [];
+  // An index grant is kept only if it is still wanted and covers exactly the pages this publish writes.
+  const indexGrants = [];
+  for (const entry of allIndexGrants) {
+    if (publicIndex === undefined || (publicIndex && scoped(entry, wanted))) indexGrants.push(entry);
+    else await revokeSpaceAccess(api, entry.id);
   }
   return { links, publicGrants, indexGrants, publicSpace };
 }
 
 /** After the upload: opens what the visibility asks for and returns the session's share link, if it has one. */
-async function grantAccess({ api, basePath, visibility, publicIndex, access, title, shareName }) {
+async function grantAccess({ api, basePath, visibility, publicIndex, rootIndex, access, title, shareName }) {
   if (!api.accessToken) throw new Error("Spacefast published the session but did not return authority to create its private share link.");
   const grantPublic = (name, include) => createSpaceAccess(api, { audience: "public", name, capabilities: ["page.view"], resources: { include }, target: { kind: "live" } });
   if (visibility === "public" && access.publicGrants.length === 0) await grantPublic(`Public session: ${title || basePath}`.slice(0, 120), sessionResources(basePath));
-  if (publicIndex === true && access.indexGrants.length === 0) await grantPublic("Public sessions index", INDEX_RESOURCES);
+  if (publicIndex === true && access.indexGrants.length === 0) await grantPublic("Public sessions index", indexResources(rootIndex));
   if (visibility !== "private") return null;
   // Republishing keeps the link: a live link scoped to the session folder already serves the new files.
   const reusable = access.links.find((entry) => entry.subject.url && !entry.constraints?.expiresAt && !entry.constraints?.maxUses);
