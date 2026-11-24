@@ -5,6 +5,7 @@ import { viewerScript, viewerStyles } from "./viewer-assets.js";
 
 const DEFAULT_PAGE_BYTES = 256 * 1024;
 const DEFAULT_PAGE_ITEMS = 100;
+const MAX_FENCE_LINE = 64;
 
 export function renderSessionBundle(session, messages, options = {}) {
   const basePath = options.basePath || createSharePath(session.id);
@@ -137,11 +138,13 @@ export function toT3WireItem(message, index, context = {}) {
 function splitWireItem(item, maxBytes) {
   if (Buffer.byteLength(JSON.stringify(item)) <= maxBytes || !item.payload.detail) return [item];
   const base = { ...item, payload: { ...item.payload, detail: "" } };
+  const isMessage = item.payload.itemType === "user_message" || item.payload.itemType === "assistant_message";
+  const probeFragment = { sourceItemId: item.itemId, index: 999999, total: 999999, ...(isMessage && { fence: "`".repeat(MAX_FENCE_LINE) }) };
   const overhead = Buffer.byteLength(JSON.stringify({
     ...base,
     payload: {
       ...base.payload,
-      data: { ...(base.payload.data || {}), wireFragment: { sourceItemId: item.itemId, index: 999999, total: 999999 } },
+      data: { ...(base.payload.data || {}), wireFragment: probeFragment },
     },
   }));
   const budget = Math.max(4_096, maxBytes - overhead - 128);
@@ -154,7 +157,7 @@ function splitWireItem(item, maxBytes) {
       payload: {
         ...base.payload,
         detail: chunk,
-        data: { ...(base.payload.data || {}), wireFragment: { sourceItemId: item.itemId, index: 999999, total: 999999 } },
+        data: { ...(base.payload.data || {}), wireFragment: probeFragment },
       },
     };
     const bytes = Buffer.byteLength(JSON.stringify(probe));
@@ -162,9 +165,12 @@ function splitWireItem(item, maxBytes) {
       chunks.push(chunk);
       continue;
     }
-    const splitAt = Math.max(1, Math.floor(chunk.length * (maxBytes / bytes) * 0.9));
+    let splitAt = Math.max(1, Math.floor(chunk.length * (maxBytes / bytes) * 0.9));
+    const lineEnd = chunk.lastIndexOf("\n", splitAt - 1) + 1;
+    if (lineEnd > splitAt / 2) splitAt = lineEnd;
     pending.unshift(chunk.slice(0, splitAt), chunk.slice(splitAt));
   }
+  const fences = isMessage ? openFences(chunks) : [];
   return chunks.map((detail, index) => ({
     ...base,
     eventId: `${item.eventId}:fragment:${index + 1}`,
@@ -174,10 +180,30 @@ function splitWireItem(item, maxBytes) {
       detail,
       data: {
         ...(base.payload.data || {}),
-        wireFragment: { sourceItemId: item.itemId, index: index + 1, total: chunks.length },
+        wireFragment: { sourceItemId: item.itemId, index: index + 1, total: chunks.length, ...(fences[index] && { fence: fences[index] }) },
       },
     },
   }));
+}
+
+// For each chunk, the opening line of the Markdown code fence it starts inside, if any.
+// The viewer reopens that fence when the chunk begins a page.
+function openFences(chunks) {
+  const fences = [];
+  let open = null;
+  let partialLine = "";
+  for (const chunk of chunks) {
+    fences.push(open ? open.line : null);
+    const lines = (partialLine + chunk).split("\n");
+    partialLine = lines.pop();
+    for (const line of lines) {
+      const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (!match) continue;
+      if (!open) open = { marker: match[1], line: line.trim().slice(0, MAX_FENCE_LINE) };
+      else if (match[1][0] === open.marker[0] && match[1].length >= open.marker.length && !match[2].trim()) open = null;
+    }
+  }
+  return fences;
 }
 
 function splitUtf8(value, maxBytes) {
@@ -186,6 +212,9 @@ function splitUtf8(value, maxBytes) {
   let start = 0;
   while (start < buffer.length) {
     let end = Math.min(start + maxBytes, buffer.length);
+    // Prefer ending on a line so Markdown blocks are not cut mid-line.
+    const lineEnd = end < buffer.length ? buffer.lastIndexOf(0x0a, end - 1) + 1 : 0;
+    if (lineEnd > start + maxBytes / 2) end = lineEnd;
     while (end > start && end < buffer.length && (buffer[end] & 0xc0) === 0x80) end -= 1;
     if (end === start) end = Math.min(start + maxBytes, buffer.length);
     chunks.push(buffer.subarray(start, end).toString("utf8"));

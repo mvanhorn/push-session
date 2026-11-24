@@ -1,106 +1,114 @@
-const SECRET_KEY = /secret|token|password|passwd|api[_-]?key|private[_-]?key|access[_-]?key/i;
-const TOKEN_RULES = [
-  ["anthropic", /(?<![\w-])sk-ant-[A-Za-z0-9_-]{20,200}(?![\w-])/gd],
-  ["openai", /(?<![\w-])sk-(?:(?:proj-|svcacct-)[A-Za-z0-9_-]{20,200}|(?!ant-|proj-|svcacct-)[A-Za-z0-9_-]{20,200})(?![\w-])/gd],
-  ["github", /(?<![\w-])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})(?![\w-])/gd],
-  ["gitlab", /(?<![\w-])glpat-[A-Za-z0-9_-]{20,255}(?![\w-])/gd],
-  ["slack", /(?<![\w-])xox[abprs]-[A-Za-z0-9-]{10,255}(?![\w-])/gd],
-  ["stripe", /(?<![\w-])(?:sk|rk)_live_[A-Za-z0-9]{16,200}(?![\w-])/gd],
-  ["aws", /(?<![\w-])(?:AKIA|ASIA)[A-Z0-9]{16}(?![\w-])/gd],
-  ["google", /(?<![\w-])AIza[A-Za-z0-9_-]{35}(?![\w-])/gd],
-  ["npm", /(?<![\w-])npm_[A-Za-z0-9]{36}(?![\w-])/gd],
+import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
+
+const MASK = "[redacted]";
+
+// Well-known credential shapes. Each pattern keeps group 1 (a label or prefix) and masks the rest.
+const PATTERNS = [
+  /()-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+  /()\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /()\bsk-[A-Za-z0-9_-]{20,}/g,
+  /()\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g,
+  /()\bxox[abeprs]-[A-Za-z0-9-]{10,}/g,
+  // Authorization headers: the scheme stays, the credential goes. In a header any length is a
+  // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
+  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi,
+  // Schemes whose credential is several fields. In a quoted value ("Authorization": "Digest ...") or
+  // a quoted header ('Authorization: Digest ...') everything up to the closing quote goes, so what
+  // follows it stays. Otherwise everything to the end of the line goes, unless it is the mask already.
+  /(\bAuthorization["']\s*:\s*(["'])(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi,
+  /((["'])(?:Proxy-)?Authorization\s*:\s*(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi,
+  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\](?:["']|[ \t]*(?:\n|$)))[^\n]+/gi,
+  /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g,
+  // Environment-style NAME_KEY=value assignments; the name stays readable. A quoted value is masked
+  // up to its closing quote, spaces and escaped quotes included, so none of it is left behind.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=(["']))(?!\[redacted\])(?:\\[\s\S]|(?!\2)[^\\]){8,}(?=\2)/g,
+  // The same inside a JSON string, where the quotes themselves are escaped and a quote escaped
+  // within the value is written \\\". Each alternative starts differently, so a value that never
+  // closes is given up on at once instead of being split every possible way.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\(?:\\[\s\S]|[^\\])|\\(?!\\|\2)[\s\S]|[^\\]){8,}(?=\\\2)/g,
+  // A value that reading finds no end for, such as one whose last character is a backslash, is
+  // masked up to the first quote after it instead of being left as it is.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\|\\(?!\\|\2)[\s\S]|[^\\]){8,}?(?=\\\2)/g,
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
+  // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
+  // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
+  /(["'][A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd)[A-Za-z0-9_-]*\\?["']\s*:\s*\\?["'])(?!\[redacted\])(?=[^\s"'\\]*[\d_+/=.-])[^\s"'\\]{8,}(?=\\?["'])/gi,
 ];
 
-// Capture just the value so keys, quotes, and surrounding commands survive.
-const ASSIGNMENT_RULES = [
-  { pattern: /(?<![\w.-])([A-Za-z_][\w.-]*)[ \t]*=[ \t]*(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s"'`,;<>()[\]{}]+))/gd, key: 1, values: [2, 3, 4] },
-  { pattern: /(["'])([A-Za-z_][\w.-]*)\1[ \t]*:[ \t]*(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)')/gd, key: 2, values: [3, 4] },
-];
+export function redactText(value) {
+  let count = 0;
+  let text = value;
+  for (const pattern of PATTERNS) {
+    text = text.replace(pattern, (_match, keep) => {
+      count += 1;
+      return `${keep}${MASK}`;
+    });
+  }
+  return { text, count };
+}
 
-export function redactText(text) {
-  const matches = [];
-  const add = (match, kind, group = 0) => {
-    const [start, end] = match.indices[group];
-    matches.push({ start, end, kind });
+// How many secrets a gzipped tar holds: its files sit uncompressed inside, so the patterns apply to
+// the unpacked bytes. Null means it could not be unpacked, which is treated as unsafe.
+function archiveSecrets(content) {
+  try {
+    return redactText(gunzipSync(content, { maxOutputLength: 256 * 1024 * 1024 }).toString("latin1")).count;
+  } catch {
+    return null;
+  }
+}
+
+const CREDENTIAL_FIELD =/api[_-]?key|access[_-]?key|private[_-]?key|secret|token|password|passwd/i;
+const AUTHORIZATION_FIELD = /^(?:proxy-)?authorization$/i;
+const ALREADY_MASKED = /^\s*(?:(?:Bearer|Basic|Digest|Negotiate|NTLM)\s+)?\[redacted\]\s*$/i;
+const CREDENTIAL_VALUE = /^(?=\S*[\d_+/=.-])\S{8,}$/;
+
+/**
+ * Masks credentials in every string of a transcript, or of recovered artifact and Site sources,
+ * and reports how many were masked. The input is not mutated.
+ */
+export function redactDeep(input) {
+  let count = 0;
+  const text = (value, key) => {
+    // An Authorization value is a credential whatever its shape. Only one that is already the mask
+    // in full, after its scheme, is left as it is.
+    if (typeof key === "string" && AUTHORIZATION_FIELD.test(key) && value.trim() && !ALREADY_MASKED.test(value)) {
+      count += 1;
+      return value.replace(/^(\s*(?:Bearer|Basic|Digest|Negotiate|NTLM)\s+)?[\s\S]*$/i, `$1${MASK}`);
+    }
+    if (typeof key === "string" && CREDENTIAL_FIELD.test(key) && CREDENTIAL_VALUE.test(value)) {
+      count += 1;
+      return MASK;
+    }
+    const result = redactText(value);
+    count += result.count;
+    return result.text;
   };
-  for (const [kind, pattern] of TOKEN_RULES) {
-    for (const match of text.matchAll(pattern)) add(match, kind);
-  }
-  for (const match of text.matchAll(/-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?-----END \1-----/gd)) {
-    add(match, "private-key");
-  }
-  for (const match of text.matchAll(/\bAuthorization["']?[ \t]*:[ \t]*["']?(Bearer|Basic)[ \t]+([A-Za-z0-9._~+/-]+=*)(?![\w=])/gdi)) {
-    if (isSecretValue(match[2])) add(match, match[1].toLowerCase(), 2);
-  }
-  for (const match of text.matchAll(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/:@]+:([^\s/@]+)@[^\s/]+/gd)) {
-    if (!isPlaceholder(match[1])) add(match, "url-password", 1);
-  }
-  for (const { pattern, key, values } of ASSIGNMENT_RULES) {
-    for (const match of text.matchAll(pattern)) {
-      const group = values.find((index) => match[index] !== undefined);
-      const quoted = group !== values[values.length - 1];
-      // `KEY=getSecret()` is a call, not a literal.
-      if (!quoted && text[match.indices[group][1]] === "(") continue;
-      if (SECRET_KEY.test(match[key]) && isSecretValue(match[group]) && (quoted || !isCodeExpression(match[group]))) {
-        add(match, "assignment", group);
-      }
+  const walk = (value, key) => {
+    if (typeof value === "string") return text(value, key);
+    if (Buffer.isBuffer(value)) {
+      // Binary files (images, archives) have no text to mask.
+      if (value.includes(0)) return value;
+      const source = value.toString("utf8");
+      const masked = text(source);
+      return masked === source ? value : Buffer.from(masked);
     }
-  }
-
-  // Prefer the outermost match. Equal spans retain the more specific token kind.
-  // Work on original offsets so replacement markers cannot be matched again.
-  matches.sort((a, b) => a.start - b.start || b.end - a.end);
-  const counts = {};
-  const parts = [];
-  let offset = 0;
-  for (const { start, end, kind } of matches) {
-    if (start < offset) continue;
-    parts.push(text.slice(offset, start), `[redacted: ${kind}]`);
-    counts[kind] = (counts[kind] || 0) + 1;
-    offset = end;
-  }
-  parts.push(text.slice(offset));
-  return { text: parts.join(""), counts };
-}
-
-export function redactMessages(messages) {
-  const counts = {};
-  const walk = (value, key = "") => {
-    if (typeof value === "string") {
-      const header = /^authorization$/i.test(key) ? "Authorization: " : "";
-      const result = redactText(header + value);
-      // Structured tool arguments need the same assignment rule as JSON text.
-      if (SECRET_KEY.test(key) && isSecretValue(value)) {
-        const kinds = Object.keys(result.counts);
-        const kind = kinds.length === 1 && result.text === `[redacted: ${kinds[0]}]` ? kinds[0] : "assignment";
-        counts[kind] = (counts[kind] || 0) + 1;
-        return `[redacted: ${kind}]`;
-      }
-      for (const [kind, count] of Object.entries(result.counts)) counts[kind] = (counts[kind] || 0) + count;
-      return result.text.slice(header.length);
+    if (Array.isArray(value)) return value.map((entry) => walk(entry));
+    if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return value;
+    const before = count;
+    const result = Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, walk(entry, name)]));
+    if (result.content !== value.content && (typeof result.content === "string" || Buffer.isBuffer(result.content))) {
+      // A masked source file no longer matches its recorded size and hash.
+      if ("bytes" in result) result.bytes = Buffer.byteLength(result.content);
+      if ("sha256" in result) result.sha256 = createHash("sha256").update(result.content).digest("hex");
     }
-    if (Array.isArray(value)) return value.map((item) => walk(item, key));
-    if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, walk(item, name)]));
+    // A packaged archive cannot be masked, so it is left out when it or its files hold secrets.
+    if (Buffer.isBuffer(value.archive?.content)) {
+      const found = archiveSecrets(value.archive.content);
+      count += found || 0;
+      if (found !== 0 || (count > before && Array.isArray(value.files))) result.archive = null;
     }
-    return value;
+    return result;
   };
-  return { messages: messages.map((message) => walk(message)), counts };
-}
-
-function isSecretValue(value) {
-  return value.length >= 8 && !/\s/.test(value) && !isPlaceholder(value);
-}
-
-// Placeholders and variable references are not secrets: `${TOKEN}`, `$API_KEY`,
-// `<token>`, `***`, `xxxxxxxx`, `...`.
-function isPlaceholder(value) {
-  return /^(?:\$|<|\{|%|\[redacted)/.test(value) || /^(?:[.*x]+|pass(?:word)?|changeme|redacted)$/i.test(value);
-}
-
-// Unquoted right-hand sides in code are usually expressions, not literals:
-// `process.env.API_KEY`, `getToken()`, `/regex/`, `options.secret`.
-function isCodeExpression(value) {
-  return /^[/@!]/.test(value) || /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value) || /\(/.test(value) ||
-    /^(?:true|false|null|undefined|None|True|False)$/.test(value);
+  return { value: walk(input), count };
 }

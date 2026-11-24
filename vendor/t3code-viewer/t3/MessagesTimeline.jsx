@@ -71,7 +71,7 @@ export function UserTimelineRow({ message, groupedWithNext = false }) {
   const text = message.detail || "";
   const collapsible = text.length > 1_200;
   return (
-    <section className={`user-row timeline-row ${groupedWithNext ? "grouped" : ""}`}>
+    <section className={`user-row timeline-row ${groupedWithNext ? "grouped" : ""}`} data-message-id={message.itemId}>
       <div className={`user-bubble ${collapsible && !expanded ? "collapsed" : ""}`}>
         <ChatMarkdown text={text} lineBreaks />
       </div>
