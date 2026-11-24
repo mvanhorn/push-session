@@ -107,6 +107,12 @@ test("masks a quoted assignment up to its closing quote, and a whole Authorizati
 
   assert.deepEqual(redactText("Authorization: Digest [redacted]\nnext"), { text: "Authorization: Digest [redacted]\nnext", count: 0 });
 
+  // An escaped quote that never closes, followed by many escapes, is left alone without a long search.
+  const unclosed = 'API_KEY=\\"' + "\\\\a".repeat(5000);
+  const started = performance.now();
+  assert.deepEqual(redactText(unclosed), { text: unclosed, count: 0 });
+  assert.ok(performance.now() - started < 1000, "an unclosed value is not searched exponentially");
+
   const digest = 'Digest username="u", nonce="[redacted]", response="6629fae49393a05397450978507c4ef1"';
   const fields = redactDeep([{ input: { Authorization: digest, authorization: "Bearer [redacted]" } }]);
   assert.deepEqual(fields.value[0].input, { Authorization: "Digest [redacted]", authorization: "Bearer [redacted]" });

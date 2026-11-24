@@ -24,8 +24,9 @@ const PATTERNS = [
   // up to its closing quote, spaces and escaped quotes included, so none of it is left behind.
   /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=(["']))(?!\[redacted\])(?:\\[\s\S]|(?!\2)[^\\]){8,}(?=\2)/g,
   // The same inside a JSON string, where the quotes themselves are escaped and a quote escaped
-  // within the value is written \\\".
-  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\(?:\\[\s\S]|[^\\])|\\(?!\2)[\s\S]|[^\\]){8,}(?=\\\2)/g,
+  // within the value is written \\\". Each alternative starts differently, so a value that never
+  // closes is given up on at once instead of being split every possible way.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\(?:\\[\s\S]|[^\\])|\\(?!\\|\2)[\s\S]|[^\\]){8,}(?=\\\2)/g,
   /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
   // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
   // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
