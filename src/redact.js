@@ -19,9 +19,9 @@ const PATTERNS = [
   ["npm", /()(?<![\w-])npm_[A-Za-z0-9]{36}(?![\w-])/g],
   // The password of scheme://user:password@host; the user, which may be empty, and the host stay.
   // Neither part runs past a quote or a bracket, so the match stays inside the string the URL is in.
-  // A password may hold a "?" or "#" that was pasted unencoded; a port followed by one is a query or
-  // fragment that happens to hold an "@", not a password.
-  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@?#"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@"'`\\<>{}]{1,512}(?=@[^\s/@?#"'`\\<>{}])/g, (value) => !isPlaceholder(value) && !/^\d{1,5}[?#]/.test(value)],
+  // A password may hold a "?" or "#" that was pasted unencoded; a host's port followed by one is a
+  // query or fragment that happens to hold an "@", not a password.
+  ["url-password", /(\b[A-Za-z][A-Za-z0-9+.-]{1,20}:\/\/[^\s/:@?#"'`\\<>{}]{0,256}:)(?!\[redacted\])[^\s/@"'`\\<>{}]{1,512}(?=@[^\s/@?#"'`\\<>{}])/g, (value, keep) => !isPlaceholder(value) && !isPortAndQuery(value, keep)],
   // Authorization headers: the scheme stays, the credential goes. In a header any length is a
   // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
   ["authorization", /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi],
@@ -67,6 +67,13 @@ function namesCredential(keep) {
 function isPlaceholder(value) {
   return /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|\$\(.*\)|<[^<>]*>|\{\{?[^{}]*\}\}?|%[A-Za-z_][A-Za-z0-9_]*%|\[redacted\])$/.test(value)
     || /^(?:[.*x]+|pass(?:word)?|changeme|redacted)$/i.test(value);
+}
+
+// host:8080?email=a@b reads like user:password@host. It is a port when what stands before it is a
+// host name, which a user name rarely looks like.
+function isPortAndQuery(value, keep) {
+  const host = keep.slice(keep.indexOf("://") + 3, -1);
+  return /^\d{1,5}[?#]/.test(value) && (host.includes(".") || host === "localhost");
 }
 
 // A bare right-hand side that is a call rather than a literal secret: getToken().
