@@ -86,8 +86,8 @@ Options: `--pick-space`, `--space <id>`, `--new-space`, `--team <slug>`,
 
 ## Manage what you've shared
 
-List sessions in your remembered Space, including their titles, agents, routes,
-share links, and created dates:
+`list` shows the sessions in your Space: the agent, the title, who can open
+each one, when it was last active, and the address that opens it.
 
 ```bash
 npx push-session list
@@ -97,17 +97,15 @@ npx push-session unshare <session-id> --keep-files
 npx push-session unshare <session-id> --yes
 ```
 
-`unshare` revokes every share link scoped to that session and removes its files
-from the live Space, including transcript pages and recovered artifacts. It asks
+`unshare` takes a session back. It ends every share link scoped to that session
+and its public access, removes its files from the live Space (transcript pages
+and recovered artifacts included), and takes it off the sessions page. It asks
 for confirmation first. Use `--yes` to skip the prompt, or `--json` for a
 non-interactive result. Without a terminal, one of those flags is required.
-`--keep-files` revokes the links while leaving the files in place.
-Both commands accept `--space <id>` to manage another Space once.
-
-Re-sharing a session updates its route and reuses an active, unexpired, view-only
-link to that live session when available. If a claim token cannot list or revoke
-links, the CLI asks you to sign in with `sf login`; publishing can still create
-a new link when it cannot check existing ones.
+`--keep-files` ends the links and public access but leaves the files, so the
+session stays on the list for your team as a private one.
+Both commands accept `--space <id>` to manage another Space once. A signed-out
+Space has to be claimed before it can be managed.
 
 File removal affects the live version. Earlier immutable versions, downloaded
 copies, and broader Space access are not removed by `unshare`.

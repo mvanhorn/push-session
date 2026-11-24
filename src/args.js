@@ -7,6 +7,7 @@ export function parseArgs(argv, env = process.env) {
     dryRun: false,
     help: false,
     json: false,
+    keepFiles: false,
     limit: 12,
     newSpace: false,
     pickSpace: false,
@@ -15,6 +16,7 @@ export function parseArgs(argv, env = process.env) {
     team: undefined,
     version: false,
     visibility: undefined,
+    yes: false,
   };
   const positionals = [];
 
@@ -35,6 +37,8 @@ export function parseArgs(argv, env = process.env) {
     else if (value === "--new-space") options.newSpace = true;
     else if (value === "--pick-space") options.pickSpace = true;
     else if (value === "--no-redact") options.redact = false;
+    else if (value === "--keep-files") options.keepFiles = true;
+    else if (value === "--yes") options.yes = true;
     else if (VISIBILITY_FLAGS.has(value)) {
       if (options.visibility) throw new Error("--public and --private cannot be used together.");
       options.visibility = value.slice(2);
