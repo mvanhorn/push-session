@@ -70,10 +70,10 @@ function isPlaceholder(value) {
 }
 
 // host:8080?email=a@b reads like user:password@host. It is a port when what stands before it is a
-// host name, which a user name rarely looks like.
+// host name and what follows it is shaped like a query, with a name and an "=".
 function isPortAndQuery(value, keep) {
   const host = keep.slice(keep.indexOf("://") + 3, -1);
-  return /^\d{1,5}[?#]/.test(value) && (host.includes(".") || host === "localhost");
+  return /^\d{1,5}[?#].*=/.test(value) && (host.includes(".") || host === "localhost");
 }
 
 // A bare right-hand side that is a call rather than a literal secret: getToken().

@@ -166,9 +166,11 @@ test("masks only the password of a URL with credentials", () => {
     ["postgres://u:$ecret12@host/db", "postgres://u:[redacted]@host/db"],
     ["postgres://admin:2024#Spring!@db.internal/app", "postgres://admin:[redacted]@db.internal/app"],
     ["mysql://root:12345?x@h", "mysql://root:[redacted]@h"],
+    ["postgres://user.name:12345#x@host", "postgres://user.name:[redacted]@host"],
+    ["postgres://first.last:2024?Pw@db/app", "postgres://first.last:[redacted]@db/app"],
   ]) assert.equal(redactText(input).text, expected, input);
   // A port followed by a query or a fragment is not a password, whatever "@" comes later.
-  for (const text of ["https://example.test:8080?email=alice@example.org/path", "https://example.test:8080#alice@example.org", "http://localhost:3000?to=a@b.test"]) assert.equal(redactText(text).count, 0, text);
+  for (const text of ["https://example.test:8080?email=alice@example.org/path", "https://example.test:8080#to=alice@example.org", "http://localhost:3000?to=a@b.test"]) assert.equal(redactText(text).count, 0, text);
   // A key that is the password is counted once, as the key.
   assert.deepEqual(redactText(`https://user:ghp_${"a".repeat(36)}@host.test`).kinds, { github: 1 });
 });
