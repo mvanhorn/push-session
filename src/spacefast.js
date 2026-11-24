@@ -6,10 +6,11 @@ import { DEFAULT_API_URL } from "./auth.js";
 import { packageVersion } from "./version.js";
 
 const MAX_PUBLISH_ATTEMPTS = 10;
+const MAX_TRANSIENT_RETRIES = 3;
+const MAX_TRANSIENT_WAIT_MS = 30_000;
 const MAX_FOLLOW_STEPS = 80;
 const DEFAULT_INLINE_LIMIT = 100 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 6;
-export const MANAGE_SIGN_IN_MESSAGE = "Sign in with `sf login` to manage shared sessions.";
 
 export async function publishSession(input) {
   const fetchImpl = input.fetchImpl || globalThis.fetch;
@@ -17,17 +18,21 @@ export async function publishSession(input) {
 
   const apiUrl = (input.apiUrl || DEFAULT_API_URL).replace(/\/$/, "");
   const files = prepareFiles(input);
-  const deletePaths = (input.deletePaths || []).map(normalizeFilePath);
-  const deleting = files.length === 0 && deletePaths.length > 0;
-  if (deletePaths.length && !input.spaceId) throw new Error("Deleting files requires an existing Space.");
   const entryPath = input.entryPath ? normalizeFilePath(input.entryPath) : files[0]?.path;
-  if (!entryPath && !deleting) throw new Error("No session entry file was provided.");
-  const basePath = deleting ? null : normalizeFilePath(input.basePath || path.posix.dirname(entryPath));
-  if (!deleting && (!entryPath.startsWith(`${basePath}/`) || !files.some((file) => file.path === entryPath))) {
+  if (!entryPath) throw new Error("No session entry file was provided.");
+  const basePath = normalizeFilePath(input.basePath || path.posix.dirname(entryPath));
+  if (!entryPath.startsWith(`${basePath}/`) || !files.some((file) => file.path === entryPath)) {
     throw new Error("The session entry file must be inside the shared directory.");
   }
   if (files.some((file) => !file.path.startsWith(`${basePath}/`))) {
     throw new Error("Every published file must be inside the shared directory.");
+  }
+  // The Space's own index pages live outside the session folder and are never covered by its share link.
+  files.push(...prepareFiles({ files: input.indexFiles || [] }));
+  const visibility = input.visibility || "private";
+  const rootIndex = input.rootIndex !== false;
+  if (visibility === "public" && !input.accessToken) {
+    throw new Error("Public sessions need you signed in. Run `sf login` or set SPACEFAST_TOKEN.");
   }
   if (new Set(files.map((file) => file.path)).size !== files.length) {
     throw new Error("The session contains duplicate publish paths.");
@@ -40,31 +45,68 @@ export async function publishSession(input) {
   const publishPayload = {
     ...(requestedSpace && { spaceId: requestedSpace }),
     publishMode: "additive",
-    ...(deletePaths.length && { deletePaths }),
     ...(!requestedSpace && { space: { title: input.spaceTitle || "Shared AI sessions" } }),
     ...(!requestedSpace && input.teamId && { teamId: input.teamId }),
     ...(!requestedSpace && input.access && { access: input.access }),
   };
   const inline = totalFileBytes(files) <= (input.inlineLimitBytes ?? DEFAULT_INLINE_LIMIT);
+  let priorAccess = requestedSpace && bearerToken
+    ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: !input.accessToken })
+    : NO_ACCESS;
   let initial;
+  // Every attempt reuses the idempotency key, so retrying a publish cannot create a second one.
+  let transientFailures = 0;
 
   for (let attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt += 1) {
     const request = inline
       ? inlinePublishRequest(publishPayload, files)
       : manifestPublishRequest(publishPayload, files);
-    const response = await fetchImpl(`${apiUrl}/v1/publish?wait=1`, {
-      method: "POST",
-      headers: {
-        ...requestHeaders({ bearerToken, idempotencyKey, idempotencyPrincipal }),
-        ...request.headers,
-      },
-      body: request.body,
-    });
-    initial = await responseJson(response);
+    let response;
+    try {
+      response = await fetchImpl(`${apiUrl}/v1/publish?wait=1`, {
+        method: "POST",
+        headers: {
+          ...requestHeaders({ bearerToken, idempotencyKey, idempotencyPrincipal }),
+          ...request.headers,
+        },
+        body: request.body,
+      });
+      initial = await responseJson(response);
+    } catch (error) {
+      // fetch rejects with a TypeError when the network fails; a gateway's HTML error page is unreadable JSON.
+      const transient = response ? isTransientStatus(error.status) : error instanceof TypeError;
+      const wait = transient ? transientDelayMs(response, transientFailures) : null;
+      if (wait === null || transientFailures >= MAX_TRANSIENT_RETRIES) throw error;
+      transientFailures += 1;
+      await delay(wait);
+      continue;
+    }
     if (response.ok) break;
+    if (isTransientStatus(response.status) && initial?.code !== "space_capacity_warming" && transientFailures < MAX_TRANSIENT_RETRIES) {
+      const wait = transientDelayMs(response, transientFailures);
+      if (wait !== null) {
+        transientFailures += 1;
+        await delay(wait);
+        continue;
+      }
+    }
     if (initial?.code === "space_claimed_credential_available" && input.claimToken && !input.accessToken && !exchangedAccessToken) {
       exchangedAccessToken = await exchangeClaimCredential({ apiUrl, claimToken: input.claimToken, fetchImpl });
       bearerToken = exchangedAccessToken;
+      // The claim key is spent and the credential is given once: the caller keeps it whatever happens next.
+      input.onCredential?.(exchangedAccessToken);
+      // The Space now belongs to an account, which may have opened it up: check again before the upload
+      // goes through. A Space that is public, or that the credential cannot manage, is no longer usable
+      // as the signed-out session Space, which is what the stage tells the caller, so it can start a
+      // new one. Any other failure is a failed publish to the same Space.
+      try {
+        priorAccess = requestedSpace
+          ? await restrictAccess({ api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: requestedSpace }, basePath, visibility, publicIndex: input.publicIndex, rootIndex, tolerant: false })
+          : NO_ACCESS;
+      } catch (error) {
+        if (error.code === "space_public" || [401, 403, 404].includes(error.status)) error.stage = "claim_exchange";
+        throw error;
+      }
       continue;
     }
     if (initial?.code !== "space_capacity_warming" || attempt === MAX_PUBLISH_ATTEMPTS) {
@@ -87,46 +129,19 @@ export async function publishSession(input) {
   const initialData = initial?.data;
   const space = data?.space || initialData?.space;
   if (!space?.id) throw new Error("Spacefast returned a publish receipt without a space ID.");
-  if (deleting) {
-    // A deletion-only version uploads nothing, so Spacefast never finalizes it
-    // on its own; it would sit at "uploaded" and the files would stay live.
-    const version = data?.version || (data?.id?.startsWith?.("ver_") ? data : null) || initialData?.version;
-    if (version?.status === "ready") return { receipt, space, deletedPaths: deletePaths };
-    if (!version?.id) throw new Error("Spacefast returned no version to finalize for the file removal.");
-    const finalized = await spaceRequest(
-      { apiUrl, spaceId: space.id, accessToken: bearerToken, fetchImpl },
-      `versions/${encodeURIComponent(version.id)}/finalize`,
-      { method: "POST", body: { channel: "live" } },
-    );
-    if (finalized?.data?.status !== "ready") {
-      throw new Error(`Spacefast did not activate the file removal (version status: ${finalized?.data?.status || "unknown"}).`);
-    }
-    return { receipt: finalized, space, deletedPaths: deletePaths };
-  }
 
-  const linkOptions = {
-    apiUrl,
-    bearerToken,
-    fetchImpl,
-    spaceId: space.id,
-    entryPath,
-    basePath,
-    title: input.session?.title,
-    shareName: input.shareName,
-  };
-  let shareLink;
-  if (requestedSpace && basePath.startsWith("sessions/")) {
-    try {
-      const links = await listShareLinks({ apiUrl, accessToken: bearerToken, fetchImpl, spaceId: space.id });
-      shareLink = links.find((link) => reusableShareLink(link, basePath));
-    } catch (error) {
-      if (!(input.claimToken && !input.accessToken && !exchangedAccessToken && [401, 403].includes(error.status))) throw error;
-      (input.warn || console.error)(`${MANAGE_SIGN_IN_MESSAGE} Could not check existing links; creating a new share link.`);
-    }
-  }
-  shareLink ||= await createScopedShareLink(linkOptions);
   const liveUrl = space.liveUrl || initialData?.space?.liveUrl || null;
   const landingUrl = liveUrl ? new URL(entryPath, ensureTrailingSlash(liveUrl)).href : null;
+  const shareLink = await grantAccess({
+    api: { apiUrl, accessToken: bearerToken, fetchImpl, spaceId: space.id },
+    basePath,
+    visibility,
+    publicIndex: input.publicIndex,
+    rootIndex,
+    access: priorAccess,
+    title: input.session?.title,
+    shareName: input.shareName,
+  });
   const claim = data?.claim || initialData?.claim;
   const version = data?.version || initialData?.version;
   const access = data?.access || initialData?.access;
@@ -135,8 +150,11 @@ export async function publishSession(input) {
     receipt,
     route: entryPath,
     basePath,
-    shareUrl: shareLink.url,
+    // Public and private sessions have no link of their own: their address is the session folder.
+    shareUrl: shareLink?.url || (liveUrl ? new URL(`${basePath}/`, ensureTrailingSlash(liveUrl)).href : null),
     landingUrl,
+    visibility,
+    publicSpace: priorAccess.publicSpace,
     link: shareLink,
     credential: exchangedAccessToken ? { accessToken: exchangedAccessToken } : null,
     space: {
@@ -232,8 +250,141 @@ async function uploadTargets({ targets, files, apiUrl, fetchImpl }) {
   }
 }
 
-async function createScopedShareLink({ apiUrl, bearerToken, fetchImpl, spaceId, entryPath, basePath, title, shareName }) {
-  if (!bearerToken) throw new Error("Spacefast published the session but did not return authority to create its private share link.");
+const NO_ACCESS = { links: [], publicGrants: [], indexGrants: [], publicSpace: false };
+
+// The sessions page is public while any session is. Its root copy is left out for a Space whose
+// home page is something else.
+function indexResources(rootIndex) {
+  return [...(rootIndex ? ["/", "/index.html"] : []), "/sessions", "/sessions/index.html", "/sessions/public.json"];
+}
+
+/**
+ * Before anything is uploaded: reads the Space's access and takes away what the session's new
+ * visibility does not allow, so new content never goes live under access that is about to end.
+ * "private": the team plus anyone with the share link. "public": anyone.
+ */
+async function restrictAccess({ api, basePath, visibility, publicIndex, rootIndex, tolerant }) {
+  const resources = sessionResources(basePath);
+  let entries;
+  try {
+    entries = await listSpaceAccess(api);
+  } catch (error) {
+    // Only a signed-out publish goes on without the listing: its Space has no public grants to
+    // leave behind, and a fresh link is always correct. Signed in, an unread listing could hide one.
+    if (!tolerant) throw error;
+    return NO_ACCESS;
+  }
+  const scoped = (entry, include) => entry.target?.kind === "live"
+    && String(entry.capabilities) === "page.view"
+    && String(entry.resources?.include) === String(include)
+    && !entry.resources.exclude?.length;
+  const isPublic = (entry) => entry.subject?.audience === "public";
+  let publicGrants = entries.filter((entry) => isPublic(entry) && scoped(entry, resources));
+  const links = entries.filter((entry) => entry.subject?.audience === "link" && entry.subject.landingPath === resources[0] && scoped(entry, resources));
+  const wanted = indexResources(rootIndex);
+  const allIndexGrants = entries.filter((entry) => isPublic(entry) && [true, false].some((root) => scoped(entry, indexResources(root))));
+  // A wider public grant, such as a public Space, opens the session whatever is set here.
+  const publicSpace = entries.some((entry) => isPublic(entry) && !publicGrants.includes(entry)
+    && (entry.resources?.include || []).some((pattern) => covers(pattern, resources[0]))
+    && !(entry.resources.exclude || []).some((pattern) => covers(pattern, resources[0])));
+  if (publicSpace && visibility === "private") {
+    const error = new Error("This Space is public, so a session in it is open to anyone. Publish with --public, or to a private Space (--pick-space or --space <id>).");
+    error.code = "space_public";
+    throw error;
+  }
+  if (visibility !== "public") {
+    for (const entry of publicGrants) await revokeSpaceAccess(api, entry.id);
+    publicGrants = [];
+  }
+  // An index grant is kept only if it is still wanted and covers exactly the pages this publish writes.
+  const indexGrants = [];
+  for (const entry of allIndexGrants) {
+    if (publicIndex === undefined || (publicIndex && scoped(entry, wanted))) indexGrants.push(entry);
+    else await revokeSpaceAccess(api, entry.id);
+  }
+  return { links, publicGrants, indexGrants, publicSpace };
+}
+
+/** After the upload: opens what the visibility asks for and returns the session's share link, if it has one. */
+async function grantAccess({ api, basePath, visibility, publicIndex, rootIndex, access, title, shareName }) {
+  if (!api.accessToken) throw new Error("Spacefast published the session but did not return authority to create its private share link.");
+  const grantPublic = (name, include) => createSpaceAccess(api, { audience: "public", name, capabilities: ["page.view"], resources: { include }, target: { kind: "live" } });
+  if (visibility === "public" && access.publicGrants.length === 0) await grantPublic(`Public session: ${title || basePath}`.slice(0, 120), sessionResources(basePath));
+  if (publicIndex === true && access.indexGrants.length === 0) await grantPublic("Public sessions index", indexResources(rootIndex));
+  if (visibility !== "private") return null;
+  // Republishing keeps the link: a live link scoped to the session folder already serves the new files.
+  const reusable = access.links.find((entry) => entry.subject.url && !entry.constraints?.expiresAt && !entry.constraints?.maxUses);
+  if (reusable) return { id: reusable.subject.linkId, url: reusable.subject.url, reused: true };
+  return createScopedShareLink({ apiUrl: api.apiUrl, bearerToken: api.accessToken, fetchImpl: api.fetchImpl, spaceId: api.spaceId, basePath, title, shareName });
+}
+
+function sessionResources(basePath) {
+  return [`/${basePath}`, `/${basePath}/**`];
+}
+
+// Whether an access pattern such as "/**" or "/sessions/**" takes in a path.
+function covers(pattern, target) {
+  return pattern === target || (pattern.endsWith("/**") && `${target}/`.startsWith(pattern.slice(0, -2)));
+}
+
+/** Every way into a Space: people, links, public grants. */
+export async function listSpaceAccess({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId }) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access`, { headers: requestHeaders({ bearerToken: accessToken }) });
+  const body = await responseJson(response);
+  if (!response.ok) throw apiError(response, body);
+  return Array.isArray(body?.data) ? body.data : [];
+}
+
+async function createSpaceAccess({ apiUrl, accessToken, fetchImpl, spaceId }, entry) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access`, {
+    method: "POST",
+    headers: { ...requestHeaders({ bearerToken: accessToken }), "content-type": "application/json" },
+    body: JSON.stringify(entry),
+  });
+  const body = await responseJson(response);
+  if (!response.ok) throw apiError(response, body);
+  return body?.data;
+}
+
+async function revokeSpaceAccess({ apiUrl, accessToken, fetchImpl, spaceId }, grantId) {
+  const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/access/${encodeURIComponent(grantId)}`, {
+    method: "DELETE",
+    headers: requestHeaders({ bearerToken: accessToken }),
+  });
+  if (!response.ok && response.status !== 404) throw apiError(response, await responseJson(response));
+}
+
+/**
+ * Reads text files from a Space's live version. `select` picks from the paths the Space holds;
+ * the result carries every path and the contents of the selected ones.
+ */
+export async function readSpaceFiles({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId, select }) {
+  const headers = requestHeaders({ bearerToken: accessToken });
+  const space = `${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}`;
+  const listing = await fetchImpl(`${space}/files`, { headers });
+  const listed = await responseJson(listing);
+  if (!listing.ok) throw apiError(listing, listed);
+  const paths = (listed?.data?.files || []).map((file) => file.path);
+  const wanted = select(paths).slice(0, 200);
+  const contents = new Map();
+  if (wanted.length === 0) return { paths, contents };
+
+  // File bytes never travel through the API: it mints one short-lived read URL per path.
+  const query = wanted.map((file) => `path=${encodeURIComponent(file)}`).join("&");
+  const minted = await fetchImpl(`${space}/versions/${encodeURIComponent(listed.data.versionId)}/files/links?${query}`, { headers });
+  const links = await responseJson(minted);
+  if (!minted.ok) throw apiError(minted, links);
+  await Promise.all(wanted.map(async (file) => {
+    const url = links?.data?.links?.[file]?.url;
+    if (!url) throw new Error(`Spacefast returned no read link for ${file}.`);
+    const response = await fetchImpl(url);
+    if (!response.ok) throw new Error(`Could not read ${file} from the Space (${response.status}).`);
+    contents.set(file, await response.text());
+  }));
+  return { paths, contents };
+}
+
+async function createScopedShareLink({ apiUrl, bearerToken, fetchImpl, spaceId, basePath, title, shareName }) {
   const response = await fetchImpl(`${apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/share-links`, {
     method: "POST",
     headers: {
@@ -309,77 +460,6 @@ export async function listSpaces({ apiUrl = DEFAULT_API_URL, accessToken, query,
   return (Array.isArray(body?.data) ? body.data : []).filter((space) => space && !space.anonymous);
 }
 
-export async function listShareLinks(options) {
-  const body = await spaceRequest(options, "share-links");
-  if (!Array.isArray(body?.data)) throw new Error("Spacefast returned an unreadable share-link list.");
-  return body.data;
-}
-
-export async function revokeShareLink({ linkId, ...options }) {
-  return spaceRequest(options, `share-links/${encodeURIComponent(linkId)}`, { method: "DELETE" });
-}
-
-export async function listFiles({ prefix = "", ...options }) {
-  const query = new URLSearchParams();
-  if (prefix) query.set("q", prefix);
-  const body = await spaceRequest(options, `files${query.size ? `?${query}` : ""}`);
-  if (!Array.isArray(body?.data?.files)) throw new Error("Spacefast returned an unreadable file list.");
-  // The API's q filter is a substring search, not a directory-prefix filter.
-  return { ...body.data, files: body.data.files.filter((file) => file.path.startsWith(prefix)) };
-}
-
-export async function readSessionMetadata({ versionId, route, ...options }) {
-  if (!versionId) return null;
-  const query = new URLSearchParams({ path: route });
-  const body = await spaceRequest(options, `versions/${encodeURIComponent(versionId)}/files/links?${query}`);
-  const url = body?.data?.links?.[route]?.url;
-  if (!url) throw new Error("Spacefast returned no read link for the session.");
-  // Signed file URLs carry their own authority; never forward the API token.
-  const response = await (options.fetchImpl || globalThis.fetch)(url);
-  if (!response.ok) throw apiError(response, await responseJson(response));
-  const html = await response.text();
-  const data = html.match(/<script id="push-session-data" type="application\/json">([\s\S]*?)<\/script>/)?.[1];
-  if (!data) return null;
-  try { return JSON.parse(data).session || null; } catch { return null; }
-}
-
-async function spaceRequest({ apiUrl = DEFAULT_API_URL, spaceId, accessToken, claimToken, fetchImpl = globalThis.fetch }, resource, { method = "GET", body: requestBody } = {}) {
-  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/v1/spaces/${encodeURIComponent(spaceId)}/${resource}`, {
-    method,
-    headers: {
-      ...requestHeaders({ bearerToken: accessToken || claimToken }),
-      ...(requestBody && { "content-type": "application/json" }),
-    },
-    ...(requestBody && { body: JSON.stringify(requestBody) }),
-  });
-  const body = await responseJson(response);
-  if (!response.ok) throw apiError(response, body);
-  return body;
-}
-
-export function isSessionShareLink(link, basePath) {
-  const root = `/${basePath}`;
-  const includes = link.resources?.include;
-  return Boolean(includes?.length
-    && includes.every((value) => value === root || value.startsWith(`${root}/`)));
-}
-
-function reusableShareLink(link, basePath) {
-  const root = `/${basePath}`;
-  const landing = link.landingPath?.replace(/\/$/, "");
-  const constraints = link.constraints || {};
-  return link.url && link.active && !link.revokedAt
-    && (!constraints.expiresAt || Date.parse(constraints.expiresAt) > Date.now())
-    && (!constraints.notBefore || Date.parse(constraints.notBefore) <= Date.now())
-    && (!constraints.maxUses || link.openCount < constraints.maxUses)
-    && link.target?.kind === "live"
-    && (landing === root || landing === `${root}/index.html`)
-    && isSessionShareLink(link, basePath)
-    && link.resources.include.includes(root) && link.resources.include.includes(`${root}/**`)
-    && !link.resources.exclude?.length
-    && link.capabilities?.length === 1 && link.capabilities[0] === "page.view";
-}
-
 export function sessionRoute(session) {
   return `sessions/${safeSegment(session?.id)}/index.html`;
 }
@@ -417,8 +497,21 @@ async function responseJson(response) {
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`Spacefast returned an unreadable response (${response.status}).`);
+    const error = new Error(`Spacefast returned an unreadable response (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
+}
+
+function isTransientStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+// Backs off 1s, 2s, 4s unless the server names a wait. Null means the wait is too long to sit through.
+function transientDelayMs(response, failures) {
+  const seconds = Number.parseInt(response?.headers?.get("retry-after") || "", 10);
+  const wait = Number.isFinite(seconds) ? seconds * 1_000 : 1_000 * 2 ** failures;
+  return wait <= MAX_TRANSIENT_WAIT_MS ? wait : null;
 }
 
 function apiError(response, body) {

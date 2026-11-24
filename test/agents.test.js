@@ -73,15 +73,20 @@ test("discovers and maps a Claude session with paired tool output", (context) =>
     { type: "assistant", timestamp: "2026-08-13T12:00:01Z", message: { model: "claude-sonnet", content: [{ type: "text", text: "I will inspect it." }, { type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "test.js" } }] } },
     { type: "user", timestamp: "2026-08-13T12:00:02Z", message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "test contents" }] } },
     { type: "assistant", timestamp: "2026-08-13T12:00:03Z", message: { content: [{ type: "text", text: "Fixed." }] } },
+    { type: "user", timestamp: "2026-08-13T12:00:04Z", message: { content: "<command-name>/model</command-name>\n<command-args></command-args>" } },
+    { type: "user", timestamp: "2026-08-13T12:00:05Z", message: { content: "<local-command-stdout>Set model to opus</local-command-stdout>" } },
+    { type: "assistant", timestamp: "2026-08-13T12:00:06Z", message: { content: [{ type: "tool_use", id: "tool-2", name: "Read", input: { file_path: "shot.png" } }] } },
+    { type: "user", timestamp: "2026-08-13T12:00:07Z", message: { content: [{ type: "tool_result", tool_use_id: "tool-2", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo" } }] }] } },
   ]);
 
   const adapter = createClaudeAdapter({ home });
   const sessions = adapter.discover();
   assert.equal(sessions[0].title, "Fix the test");
   const messages = adapter.load(sessions[0]);
-  assert.deepEqual(messages.map((message) => message.role), ["user", "assistant", "tool", "assistant"]);
+  assert.deepEqual(messages.map((message) => message.role), ["user", "assistant", "tool", "assistant", "tool"], "slash-command echoes are not user turns");
   assert.equal(messages[2].name, "Read");
   assert.equal(messages[2].output, "test contents");
+  assert.equal(messages[4].output, "[image]");
 });
 
 test("discovers Codex sessions with large metadata and transcript timestamps", (context) => {
@@ -194,8 +199,8 @@ test("uses Cursor workspace metadata and message timestamps when available", (co
   fs.writeFileSync(path.join(projectDir, ".workspace-trusted"), JSON.stringify({ workspacePath: "/work/exact-cursor-project" }));
   writeJsonl(path.join(transcriptDir, `${id}.jsonl`), [
     { role: "user", timestamp: 1_786_622_400, message: { content: [{ type: "text", text: "<environment_context>generated</environment_context>" }] } },
-    { role: "user", timestamp: 1_786_622_460, message: { content: [{ type: "text", text: "<user_query>Fix the parser</user_query>" }] } },
-    { role: "assistant", timestamp: 1_786_622_520, message: { content: [{ type: "text", text: "Done." }] } },
+    { role: "user", timestamp: 1_786_622_460, message: { content: [{ type: "text", text: "<manually_attached_skills>\nThe user attached a skill.\n</manually_attached_skills>\n<timestamp>Tuesday, Sep 22, 2026, 10:21 PM (UTC+2)</timestamp>\n<user_query>\nFix the parser\n</user_query>" }] } },
+    { role: "assistant", timestamp: 1_786_622_520, message: { content: [{ type: "text", text: "Done. Wrap it as <user_query>Fix the parser</user_query> next time." }] } },
   ]);
 
   const adapter = createCursorAdapter({ home });
@@ -204,7 +209,7 @@ test("uses Cursor workspace metadata and message timestamps when available", (co
   assert.equal(session.project, "/work/exact-cursor-project");
   assert.equal(session.createdAt, 1_786_622_400_000);
   assert.equal(session.updatedAt, 1_786_622_520_000);
-  assert.deepEqual(adapter.load(session).map((message) => message.content), ["Fix the parser", "Done."]);
+  assert.deepEqual(adapter.load(session).map((message) => message.content), ["Fix the parser", "Done. Wrap it as <user_query>Fix the parser</user_query> next time."]);
 });
 
 test("discovers Pi sessions and renders only the active branch", (context) => {
@@ -274,13 +279,12 @@ function writeJsonl(filePath, entries) {
 }
 
 test("discovers T3 threads and maps messages and completed tool activity", async (context) => {
-  const { execFileSync } = await import("node:child_process");
   const { createT3Adapter } = await import("../src/agents/t3.js");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-t3-"));
   context.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.mkdirSync(path.join(home, "userdata"));
   const file = path.join(home, "userdata", "state.sqlite");
-  execFileSync("sqlite3", [file], { input: `
+  await createDatabase(file, `
     CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT);
     CREATE TABLE projection_threads (thread_id TEXT, project_id TEXT, title TEXT, worktree_path TEXT, model_selection_json TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT);
     CREATE TABLE projection_thread_messages (thread_id TEXT, role TEXT, text TEXT, created_at TEXT);
@@ -293,7 +297,7 @@ test("discovers T3 threads and maps messages and completed tool activity", async
     INSERT INTO projection_thread_messages VALUES ('t3-session', 'assistant', 'Done', '2026-08-13T12:03:00Z');
     INSERT INTO projection_thread_activities VALUES ('t3-session', 'tool', 'tool.updated', 'Running', '{}', '2026-08-13T12:01:00Z');
     INSERT INTO projection_thread_activities VALUES ('t3-session', 'tool', 'tool.completed', 'Run tests', '{"data":{"toolName":"Bash","input":{"command":"npm test"},"result":{"content":"failed test","is_error":true}}}', '2026-08-13T12:02:00Z');
-  ` });
+  `);
   const adapter = createT3Adapter({ home });
   assert.equal(adapter.installed(), true);
   const [session] = adapter.discover();
@@ -314,7 +318,7 @@ test("discovers T3 threads and maps messages and completed tool activity", async
 
   // Upgrading leaves the V1 file frozen. New threads live only in the V2 copy.
   const v2File = path.join(home, "userdata", "statev2.sqlite");
-  execFileSync("sqlite3", [v2File], { input: `
+  await createDatabase(v2File, `
     CREATE TABLE projection_projects (project_id TEXT, workspace_root TEXT);
     CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, project_id TEXT, title TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT, payload_json TEXT);
     CREATE TABLE orchestration_v2_projection_messages (thread_id TEXT, role TEXT, created_at TEXT, payload_json TEXT);
@@ -333,7 +337,7 @@ test("discovers T3 threads and maps messages and completed tool activity", async
     INSERT INTO orchestration_v2_projection_messages VALUES ('v2-session', 'assistant', '2026-11-01T12:03:00Z', '{"text":"New reply"}');
     INSERT INTO orchestration_v2_projection_turn_items VALUES ('v2-session', 'command', 1, 'command_execution', 'failed', '2026-11-01T12:02:00Z', '{"input":"npm test","output":"v2 failure","exitCode":1,"startedAt":"2026-11-01T12:01:00Z"}');
     INSERT INTO orchestration_v2_projection_turn_items VALUES ('v2-session', 'dynamic', 2, 'dynamic_tool', 'completed', '2026-11-01T12:02:00Z', '{"toolName":"Read","input":{"file_path":"src/app.js"},"output":"source contents"}');
-  ` });
+  `);
   const [active] = adapter.discover();
   assert.deepEqual(adapter.discover().map((item) => item.id), ["v2-session", "fork-session"]);
   const [fork] = adapter.discover({ query: "fork-session" });
@@ -356,4 +360,63 @@ test("discovers T3 threads and maps messages and completed tool activity", async
   assert.equal(adapter.installed(), true, "fresh V2 installations need no V1 file");
   assert.equal(adapter.discover({ query: "v2-s" })[0].id, "v2-session");
   assert.equal(createT3Adapter({ stateDir: path.dirname(v2File) }).discover()[0].filePath, v2File);
+});
+
+// Prefer Node's built-in SQLite; fall back to the sqlite3 CLI on older Node releases.
+async function createDatabase(file, sql) {
+  const { createRequire } = await import("node:module");
+  let DatabaseSync;
+  try { ({ DatabaseSync } = createRequire(import.meta.url)("node:sqlite")); } catch {}
+  if (!DatabaseSync) {
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("sqlite3", [file], { input: sql });
+    return;
+  }
+  const db = new DatabaseSync(file);
+  try { db.exec(sql); } finally { db.close(); }
+}
+
+test("Codex tool output made of content items publishes text and no image data", (context) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-codex-items-"));
+  context.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const directory = path.join(home, "sessions", "2026", "08", "13");
+  fs.mkdirSync(directory, { recursive: true });
+  writeJsonl(path.join(directory, "rollout-items.jsonl"), [
+    { type: "session_meta", payload: { id: "codex-items", timestamp: "2026-08-13T12:00:00Z", source: "cli" } },
+    { type: "event_msg", timestamp: "2026-08-13T12:00:01Z", payload: { type: "user_message", message: "Look at the screenshot" } },
+    { type: "response_item", timestamp: "2026-08-13T12:00:02Z", payload: { type: "function_call", name: "view_image", call_id: "call-1", arguments: "{\"path\":\"shot.png\"}" } },
+    { type: "response_item", timestamp: "2026-08-13T12:00:03Z", payload: { type: "function_call_output", call_id: "call-1", output: [{ type: "input_text", text: "Viewed" }, { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo" }] } },
+  ]);
+  const adapter = createCodexAdapter({ home });
+  const [, tool] = adapter.load(adapter.discover()[0]);
+  assert.equal(tool.output, "Viewed\n[image]");
+});
+
+test("titles a Claude session whose first request sits past the quick head read", (context) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-claude-late-"));
+  context.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const project = path.join(home, "projects", "-work-demo");
+  fs.mkdirSync(project, { recursive: true });
+  writeJsonl(path.join(project, "late.jsonl"), [
+    { type: "user", timestamp: "2026-08-13T12:00:00Z", message: { content: `<system-reminder>${"x".repeat(300 * 1024)}</system-reminder>` } },
+    { type: "user", timestamp: "2026-08-13T12:00:01Z", cwd: "/work/demo", message: { content: "Late request" } },
+    { type: "assistant", timestamp: "2026-08-13T12:00:02Z", message: { content: [{ type: "text", text: `${"y".repeat(600 * 1024)}` }] } },
+    { type: "user", timestamp: "2026-08-13T12:00:03Z", message: { content: "A later follow-up" } },
+  ]);
+  const [session] = createClaudeAdapter({ home }).discover();
+  assert.equal(session.title, "Late request", "a follow-up near the end must not become the title");
+  assert.equal(session.createdAt, Date.parse("2026-08-13T12:00:00Z"));
+  assert.equal(session.project, "/work/demo");
+});
+
+test("names a Codex run that has no prompt, such as a review, by what it did", (context) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-codex-review-"));
+  context.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const directory = path.join(home, "sessions", "2026", "08", "13");
+  fs.mkdirSync(directory, { recursive: true });
+  writeJsonl(path.join(directory, "rollout-review.jsonl"), [
+    { type: "session_meta", payload: { id: "codex-review", timestamp: "2026-08-13T12:00:00Z", source: "cli" } },
+    { type: "response_item", timestamp: "2026-08-13T12:00:01Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<user_action>\n<context>User initiated a review task.</context>\n<action>review</action>\n<results>Fine.</results>\n</user_action>" }] } },
+  ]);
+  assert.equal(createCodexAdapter({ home }).discover()[0].title, "Codex review");
 });

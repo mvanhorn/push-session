@@ -9,7 +9,6 @@ import {
   deriveTitle,
   exists,
   fileStats,
-  isBootstrapMessage,
   isSyntheticUserText,
   readJsonLines,
   readPrefix,
@@ -134,13 +133,13 @@ function parseClaudeMessages(filePath) {
     const content = entry.message?.content;
     if (role === "user") {
       const text = extractClaudeText(content);
-      if (text && !isBootstrapMessage(text)) messages.push({ role, content: text, createdAt: entry.timestamp });
+      if (!isSyntheticUserText(text)) messages.push({ role, content: text, createdAt: entry.timestamp });
       for (const part of Array.isArray(content) ? content : []) {
         if (part?.type === "tool_result") {
           const result = extractClaudeText(part.content);
           const tool = tools.get(part.tool_use_id);
           if (tool) {
-            tool.output = result || part.content;
+            tool.output = result || describeNonText(part.content);
             tool.status = part.is_error ? "failed" : "completed";
             tool.isError = Boolean(part.is_error);
           } else if (result) {
@@ -193,4 +192,10 @@ function decodeProject(directory) {
   if (!directory.startsWith("-")) return directory;
   const decoded = directory.replace(/-/g, "/");
   return exists(decoded) ? decoded : directory;
+}
+
+// Image-only tool results would otherwise publish their raw base64 payload.
+function describeNonText(content) {
+  if (!Array.isArray(content) || !content.some((part) => part?.type === "image")) return content;
+  return content.map((part) => (part?.type === "image" ? "[image]" : JSON.stringify(part))).join("\n");
 }

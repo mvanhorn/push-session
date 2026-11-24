@@ -20,8 +20,9 @@ test("prints each share URL on its own unbroken output line", () => {
   });
 
   assert.equal(output.split("\n").filter((line) => line.includes(accessUrl)).length, 1);
-  assert.equal(output.split("\n").filter((line) => line.includes(versionUrl)).length, 1);
+  assert.equal(output.includes(versionUrl), false, "the version URL opens the private Space root, not the session");
   assert.match(output, /Link\n/);
+  assert.match(output, /Expires\n.*Aug 20, 2026/);
 });
 
 test("explicit session lookup checks every matching ID despite the picker limit", async () => {
@@ -46,36 +47,31 @@ test("one searchable picker lists every agent's sessions newest first despite an
   codex.discover = () => [{ agent: "codex", agentLabel: "Codex", id: "codex-old", title: "Fix the router", project: "/work/api", updatedAt: 1_000 }];
   const claude = fakeAdapter("claude");
   claude.discover = () => [{ agent: "claude", agentLabel: "Claude Code", id: "claude-new", title: "Draft the launch post", updatedAt: 2_000 }];
-  const prompts = fakePrompts([0]);
+  const prompts = fakePrompts([1]);
 
   const result = await run(["--dry-run"], { adapters: [t3, codex, claude], prompts, interactive: true, log: () => {}, warn: (message) => warnings.push(message) });
 
   const [picker] = prompts.asked;
-  assert.deepEqual(picker.options.filter((option) => typeof option.value === "number").map((option) => option.label), ["Draft the launch post", "Fix the router"]);
-  assert.match(picker.options[1].hint, /^Codex · .* · \/work\/api · codex-old$/);
-  assert.deepEqual(picker.options.filter((option) => typeof option.value === "number" && picker.filter("codex api", option)).map((option) => option.label), ["Fix the router"]);
+  assert.deepEqual(picker.options.map((option) => option.label), ["✻  Draft the launch post", "❋  Fix the router"], "each row starts with its agent's mark");
+  assert.match(picker.options[1].hint, /^.* · \/work\/api · codex-old$/);
+  assert.deepEqual(picker.options.filter((option) => picker.filter("codex api", option)).map((option) => option.label), ["❋  Fix the router"]);
   assert.equal(result.sessionId, "claude-new");
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /Could not read T3 Code sessions/);
   await assert.rejects(run(["t3", "--dry-run"], { adapters: [t3], interactive: true, prompts }), /not a database/);
 });
 
-test("picker pages across all sessions and searches beyond the page limit", async () => {
-  const adapter = fakeAdapter();
-  const first = adapter.discover()[0];
-  adapter.discover = ({ limit } = {}) => Array.from({ length: 5 }, (_, index) => ({
-    ...first, id: `session-${index}`, title: `Session ${index}`, updatedAt: 5 - index,
-  })).slice(0, limit);
-  const prompts = fakePrompts(["next", "previous", "search", "Session 4", "clear", "next", "next", 0]);
-  const result = await run(["codex", "--limit", "2", "--dry-run"], {
-    adapters: [adapter], prompts, interactive: true, log: () => {},
-  });
+test("one list holds every session and typing searches all of them", async () => {
+  const codex = fakeAdapter("codex");
+  const first = codex.discover()[0];
+  codex.discover = () => Array.from({ length: 5 }, (_, index) => ({ ...first, id: `session-${index}`, title: `Session ${index}`, updatedAt: 5 - index }));
+  const solo = fakePrompts([5]);
+  const result = await run(["codex", "--limit", "2", "--dry-run"], { adapters: [codex], prompts: solo, interactive: true, log: () => {} });
   assert.equal(result.sessionId, "session-4");
-  const pickers = prompts.asked.filter((prompt) => prompt.options);
-  assert.deepEqual(pickers[1].options.filter((item) => typeof item.value === "number").map((item) => item.label), ["Session 2", "Session 3"]);
-  assert.deepEqual(pickers[2].options.filter((item) => typeof item.value === "number").map((item) => item.label), ["Session 0", "Session 1"]);
-  assert.equal(pickers[3].options[0].label, "Session 4");
-  assert.equal(pickers.at(-1).options.some((item) => item.value === "next"), false);
+  const [picker] = solo.asked;
+  assert.deepEqual(picker.options.map((option) => option.label), ["Session 0", "Session 1", "Session 2", "Session 3", "Session 4"], "no pages: one agent, no tags");
+  assert.equal(picker.maxItems, 2, "--limit is how many are shown at a time");
+  assert.deepEqual(picker.options.filter((option) => picker.filter("session 4", option)).map((option) => option.label), ["Session 4"], "a search reaches sessions far down the list");
 });
 
 test("reuses the first global session space on later runs", async (context) => {
@@ -86,7 +82,6 @@ test("reuses the first global session space on later runs", async (context) => {
   const publishPayloads = [];
   const fetchImpl = async (url, init) => {
     if (String(url).endsWith("/share-links")) {
-      if (init.method === "GET") return jsonResponse(200, { data: [] });
       return jsonResponse(201, { data: { url: "https://sessions.example/__/access" } });
     }
     const payload = JSON.parse(init.body.get("payload"));
@@ -148,6 +143,26 @@ test("replaces rejected implicit global state without blocking the publish", asy
   assert.equal(loadConfig(env).space.id, "spc_replacement");
   assert.equal(loadConfig(env).space.claimToken, "replacement-key");
   assert.match(warnings[0], /no longer reusable/);
+});
+
+test("keeps a claimed Space and its exchanged credential when the publish fails after the exchange", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-claimed-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
+  saveConfig({ version: 1, space: { id: "spc_claimed", liveUrl: "https://sessions.example/", claimToken: "old-key" } }, env);
+  const publishes = [];
+  const fetchImpl = async (url, init) => {
+    const target = String(url);
+    if (target.endsWith("/access")) return jsonResponse(init.headers.authorization === "Bearer continued-access" ? 500 : 401, { title: "No" });
+    if (target.endsWith("/claim/exchange")) return jsonResponse(200, { data: { credential: { accessToken: "continued-access" } } });
+    publishes.push(JSON.parse(init.body.get("payload")).spaceId || null);
+    return jsonResponse(409, { code: "space_claimed_credential_available", message: "Claimed" });
+  };
+
+  await assert.rejects(run(["codex", "session-one", "--json"], { adapters: [fakeAdapter()], env, fetchImpl, log: () => {}, warn: () => {} }), { status: 500 });
+
+  assert.deepEqual(publishes, ["spc_claimed"], "no new Space is made for an outage");
+  assert.deepEqual(loadConfig(env).space, { id: "spc_claimed", liveUrl: "https://sessions.example/", accessToken: "continued-access" });
 });
 
 test("alternate API publishes and unreadable config keep the saved anonymous space", async (context) => {
@@ -420,211 +435,6 @@ test("uploads recovered ChatGPT Sites with their Codex session", async (context)
   assert.ok(uploadedPaths.includes("sessions/session-one/sites/appgprj_testsite123/versions/0001-1/source/app/page.tsx"));
 });
 
-test("lists remote session metadata and all scoped links in JSON and text", async (context) => {
-  const api = managementFixture(context);
-  const output = [];
-  const dependencies = { ...api.dependencies, log: (message) => output.push(message) };
-  const result = await run(["list", "--json"], dependencies);
-  assert.deepEqual(JSON.parse(output[0]), result);
-  assert.equal(result.spaceId, "spc_manage");
-  assert.equal(result.sessions[0].title, "Remote session");
-  assert.equal(result.sessions[0].agent, "codex");
-  assert.equal(result.sessions[0].route, "sessions/session-one");
-  assert.equal(result.sessions[0].createdAt, "2026-01-01T00:00:00Z");
-  assert.deepEqual(result.sessions[0].shareLinks.map((link) => link.id), ["first", "duplicate", "child"]);
-  await run(["list"], dependencies);
-  assert.match(output[1], /Remote session\n  Agent: codex/);
-  assert.match(output[1], /https:\/\/sessions.example\/__\/first/);
-  assert.ok(api.requests.every((request) => request.method === "GET"));
-});
-
-test("unshare revokes every scoped link and deletes only exact session file paths", async (context) => {
-  const api = managementFixture(context);
-  const result = await run(["unshare", "session-one", "--json"], api.dependencies);
-  assert.deepEqual(result.revokedLinkIds, ["first", "duplicate", "child"]);
-  assert.deepEqual(result.deletedPaths, ["sessions/session-one/index.html", "sessions/session-one/pages/0001.json"]);
-  assert.deepEqual(api.links.filter((link) => !link.revokedAt).map((link) => link.id), ["neighbor", "broad"]);
-  assert.ok(api.files.has("sessions/session-one-other/index.html"));
-  assert.ok(api.files.has("backup/sessions/session-one/index.html"));
-  const publish = api.requests.find((request) => request.path === "/v1/publish");
-  assert.deepEqual(publish.payload, { spaceId: "spc_manage", publishMode: "additive", deletePaths: result.deletedPaths });
-  assert.ok(api.requests.findIndex((request) => request.path.endsWith("/files")) < api.requests.findIndex((request) => request.method === "DELETE"));
-});
-
-test("unshare accepts routes and share or landing URLs, and --keep-files avoids publishing", async (context) => {
-  for (const target of ["sessions/session-one", "/sessions/session-one/index.html", "https://sessions.example/__/first", "https://sessions.example/sessions/session-one/"]) {
-    const api = managementFixture(context);
-    const result = await run(["unshare", target, "--keep-files", "--yes"], api.dependencies);
-    assert.equal(result.keptFiles, true);
-    assert.equal(result.revokedLinkIds.length, 3);
-    assert.equal(result.deletedPaths.length, 0);
-    assert.ok(api.requests.every((request) => request.path.includes("share-links")));
-    assert.ok(api.files.has("sessions/session-one/index.html"));
-  }
-});
-
-test("unshare requires consent, honors cancellation, and rejects unsafe targets without mutations", async (context) => {
-  const api = managementFixture(context);
-  await assert.rejects(run(["unshare", "session-one"], api.dependencies), /requires --yes or --json/);
-  const prompts = { isCancel: (value) => typeof value === "symbol", confirm: async () => false };
-  assert.deepEqual(await run(["unshare", "session-one"], { ...api.dependencies, interactive: true, prompts }), { cancelled: true });
-  prompts.confirm = async () => Symbol("cancelled");
-  assert.deepEqual(await run(["unshare", "session-one"], { ...api.dependencies, interactive: true, prompts }), { cancelled: true });
-  for (const target of [".", "..", "sessions/session-one/../other", "sessions/session-one/pages/0001.json", "https://foreign.example/sessions/session-one", "missing"]) {
-    await assert.rejects(run(["unshare", target, "--yes"], api.dependencies));
-  }
-  assert.ok(api.requests.every((request) => request.method === "GET"));
-  prompts.confirm = async (options) => {
-    assert.equal(options.initialValue, false);
-    assert.match(options.message, /Revoke 3 link\(s\) and delete 2 file\(s\)/);
-    return true;
-  };
-  assert.equal((await run(["unshare", "session-one"], { ...api.dependencies, interactive: true, prompts })).revokedLinkIds.length, 3);
-});
-
-test("claim-token permission failures name sf login and do not delete files", async (context) => {
-  for (const deniedMethod of ["GET", "DELETE"]) {
-    const api = managementFixture(context, { claim: true });
-    const fetchImpl = async (url, init) => {
-      if (init.method === deniedMethod && String(url).includes("share-links")) {
-        return jsonResponse(403, { detail: "Claim cannot manage links" });
-      }
-      return api.dependencies.fetchImpl(url, init);
-    };
-    await assert.rejects(run(deniedMethod === "GET" ? ["list", "--json"] : ["unshare", "session-one", "--json"], {
-      ...api.dependencies, fetchImpl,
-    }), /Sign in with `sf login` to manage shared sessions/);
-    assert.ok(api.files.has("sessions/session-one/index.html"));
-    assert.ok(api.requests.every((request) => request.method === "GET"));
-  }
-});
-
-test("partial unshare failure is reported and a retry finishes removing files", async (context) => {
-  const api = managementFixture(context);
-  await assert.rejects(run(["unshare", "session-one", "--json"], {
-    ...api.dependencies,
-    fetchImpl: async (url, init) => new URL(url).pathname === "/v1/publish"
-      ? jsonResponse(500, { detail: "Publish failed" }) : api.dependencies.fetchImpl(url, init),
-  }), /revoking 3 of 3 links; file removal is not confirmed/);
-  assert.ok(api.files.has("sessions/session-one/index.html"));
-  const result = await run(["unshare", "session-one", "--json"], api.dependencies);
-  assert.deepEqual(result.revokedLinkIds, []);
-  assert.equal(result.deletedPaths.length, 2);
-});
-
-test("link lookup permission failures never move an owned publish to another Space", async (context) => {
-  const api = managementFixture(context);
-  await assert.rejects(run(["codex", "session-one"], {
-    ...api.dependencies, adapters: [fakeAdapter()], interactive: true, prompts: fakePrompts([]),
-    fetchImpl: async (url, init) => init.method === "GET" && String(url).endsWith("/share-links")
-      ? jsonResponse(403, { detail: "Cannot list links" }) : api.dependencies.fetchImpl(url, init),
-  }), /Cannot list links/);
-  assert.equal(api.requests.filter((request) => request.path === "/v1/publish").length, 1);
-  assert.equal(api.requests.some((request) => request.path === "/v1/spaces"), false);
-});
-
-test("claim tokens can manage sessions when permitted, including links with a changed landing path", async (context) => {
-  const api = managementFixture(context, { claim: true });
-  api.links[0].landingPath = "/";
-  const result = await run(["unshare", "session-one", "--json"], api.dependencies);
-  assert.deepEqual(result.revokedLinkIds, ["first", "duplicate", "child"]);
-});
-
-test("publish, list, re-share, and unshare lifecycle uses one link", async (context) => {
-  const api = managementFixture(context, { empty: true });
-  const dependencies = { ...api.dependencies, adapters: [fakeAdapter()], discoverSessionSites: async () => [] };
-  const first = await run(["codex", "session-one", "--json"], dependencies);
-  const listed = await run(["list", "--json"], dependencies);
-  assert.equal(listed.sessions[0].title, "Session one");
-  assert.equal(listed.sessions[0].agent, "codex");
-  const second = await run(["codex", "session-one", "--json"], dependencies);
-  assert.equal(first.url, second.url);
-  assert.equal(api.links.length, 1);
-  await run(["unshare", first.url, "--json"], dependencies);
-  assert.deepEqual((await run(["list", "--json"], dependencies)).sessions, []);
-  context.diagnostic(`Mock request transcript (no live account): ${JSON.stringify(api.requests)}`);
-});
-
-test("management does not create Spaces or fall back across API origins", async (context) => {
-  const api = managementFixture(context);
-  for (const argv of [["list", "--new-space"], ["unshare", "session-one", "--dry-run"], ["list", "extra"], ["list", "--keep-files"], ["unshare"]]) {
-    await assert.rejects(run(argv, api.dependencies));
-  }
-  await assert.rejects(run(["list", "--api-url", "https://alternate.example"], { ...api.dependencies, resolveAuth: async () => null }), /No remembered session Space/);
-  assert.equal(api.requests.length, 0);
-});
-
-function managementFixture(context, { empty = false, claim = false } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-manage-"));
-  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
-  const space = { id: "spc_manage", liveUrl: "https://sessions.example/" };
-  saveConfig(claim ? { space: { ...space, claimToken: "claim" } } : { owned: { "https://api.spacefast.com": space } }, env);
-  const link = (id, route = "sessions/session-one") => ({
-    id, name: "Session: Remote session", url: `https://sessions.example/__/${id}`, landingPath: `/${route}`,
-    resources: { include: [`/${route}`, `/${route}/**`], exclude: [] }, capabilities: ["page.view"],
-    target: { kind: "live" }, constraints: {}, active: true, revokedAt: null, createdAt: "2026-02-01T00:00:00Z",
-  });
-  const links = empty ? [] : [link("first"), { ...link("duplicate"), landingPath: "/sessions/session-one/index.html" },
-    link("child", "sessions/session-one/artifacts/one"), link("neighbor", "sessions/session-one-other"),
-    { ...link("broad"), resources: { include: ["/**"] } }];
-  const html = '<script id="push-session-data" type="application/json">{"session":{"title":"Remote session","provider":"codex","threadId":"session-one","createdAt":"2026-01-01T00:00:00Z"}}</script>';
-  const files = new Map(empty ? [] : [
-    ["sessions/session-one/index.html", html], ["sessions/session-one/pages/0001.json", "{}"],
-    ["sessions/session-one-other/index.html", "<html>Older session</html>"], ["backup/sessions/session-one/index.html", html],
-  ]);
-  const requests = [];
-  let pendingDeletes = [];
-  const fetchImpl = async (url, init = {}) => {
-    const target = new URL(url);
-    const request = { method: init.method || "GET", path: target.pathname, ...(target.search && { query: target.search }) };
-    requests.push(request);
-    if (target.origin === "https://files.example") {
-      assert.equal(init.headers, undefined);
-      return new Response(files.get(target.searchParams.get("path")));
-    }
-    assert.equal(init.headers.authorization, `Bearer ${claim ? "claim" : "token"}`);
-    if (target.pathname.endsWith("/files/links")) {
-      const route = target.searchParams.get("path");
-      return jsonResponse(200, { data: { links: { [route]: { url: `https://files.example/read?path=${encodeURIComponent(route)}` } } } });
-    }
-    if (target.pathname.endsWith("/files")) return jsonResponse(200, { data: { versionId: "ver_one", files: [...files.keys()].map((path) => ({ path })) } });
-    if (target.pathname.endsWith("/share-links")) {
-      if (init.method === "GET") return jsonResponse(200, { data: links });
-      const created = { ...link(`new-${links.length}`), ...JSON.parse(init.body) };
-      links.push(created);
-      return jsonResponse(201, { data: created });
-    }
-    if (init.method === "DELETE") {
-      const existing = links.find((link) => link.id === target.pathname.split("/").at(-1));
-      assert.ok(existing);
-      existing.revokedAt = "2026-11-16T00:00:00Z";
-      existing.active = false;
-      return new Response(null, { status: 204 });
-    }
-    if (target.pathname === "/v1/publish") {
-      const payload = JSON.parse(init.body.get("payload"));
-      request.payload = payload;
-      assert.equal(payload.publishMode, "additive");
-      for (const file of init.body.getAll("files")) files.set(file.name, await file.text());
-      if (payload.deletePaths?.length) {
-        // Like the live API, a deletion-only version waits at "uploaded" until finalized.
-        pendingDeletes = payload.deletePaths;
-        return jsonResponse(201, { data: { space, version: { id: "ver_delete", status: "uploaded" } } });
-      }
-      return jsonResponse(201, { data: { space, next: { action: "done" } } });
-    }
-    if (target.pathname.endsWith("/versions/ver_delete/finalize")) {
-      assert.deepEqual(JSON.parse(init.body), { channel: "live" });
-      for (const path of pendingDeletes) files.delete(path);
-      pendingDeletes = [];
-      return jsonResponse(200, { data: { id: "ver_delete", status: "ready" } });
-    }
-    throw new Error(`Unexpected request: ${request.method} ${url}`);
-  };
-  return { links, files, requests, dependencies: { env, fetchImpl, interactive: false, log: () => {}, resolveAuth: async () => claim ? null : { accessToken: "token" } } };
-}
-
 function fakeAdapter(id = "codex", messages = [{ role: "assistant", content: "Done" }]) {
   const session = {
     agent: id,
@@ -659,9 +469,12 @@ function fakeOwnedApi(spaces, { missing = new Set() } = {}) {
         });
       }
       if (target.pathname.endsWith("/share-links")) {
-        if (init.method === "GET") return jsonResponse(200, { data: [] });
         return jsonResponse(201, { data: { url: `https://sessions.example/${target.pathname.split("/")[3]}/link` } });
       }
+      if (target.pathname.endsWith("/files")) {
+        return missing.has(target.pathname.split("/")[3]) ? jsonResponse(404, { code: "not_found" }) : jsonResponse(200, { data: { versionId: "ver_1", files: [] } });
+      }
+      if (target.pathname.endsWith("/access")) return jsonResponse(200, { data: [] });
       const payload = JSON.parse(init.body.get("payload"));
       publishes.push({ payload, authorization: init.headers.authorization });
       if (missing.has(payload.spaceId)) return jsonResponse(404, { code: "not_found", detail: "Space not found." });
@@ -701,3 +514,157 @@ function jsonResponse(status, body) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("an existing AI sessions Space is offered before making another", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-existing-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_TOKEN: "token" };
+  const api = fakeOwnedApi([{ id: "spc_ai", title: "AI sessions", slug: "ai-sessions", liveUrl: "https://ai.space.fast/" }]);
+  const prompts = fakePrompts(["spc_ai"]);
+  await run(["codex", "session-one"], { adapters: [fakeAdapter()], env, fetchImpl: api.fetch, prompts, interactive: true, log: () => {}, write: () => {} });
+  assert.deepEqual(prompts.asked[0].options.map((option) => option.label), ["AI sessions", "New Space · AI sessions"]);
+});
+
+test("an expired sf login stops instead of publishing to a claimable Space", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-expired-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
+  fs.writeFileSync(path.join(root, "auth.json"), JSON.stringify({ accessToken: "old", expiresAt: "2020-01-01T00:00:00Z" }));
+  let requests = 0;
+  const fetchImpl = async () => { requests += 1; throw new Error("no request expected"); };
+  await assert.rejects(run(["codex", "session-one", "--json"], { adapters: [fakeAdapter()], env, fetchImpl, log: () => {} }), /sf login has expired/);
+  assert.equal(requests, 0);
+});
+
+test("masks secrets by default, reports the count, and --no-redact publishes them as written", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-redact-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
+  const secret = `ghp_${"a".repeat(36)}`;
+  const adapter = fakeAdapter("codex", [{ role: "user", content: `deploy with ${secret}` }]);
+  adapter.discover = () => [{ agent: "codex", agentLabel: "Codex", id: "session-one", title: "Use API_KEY=abcdefgh1234" }];
+  const adapters = [adapter];
+  const publish = async (flags) => {
+    const uploads = [];
+    const fetchImpl = async (url, init = {}) => {
+      if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/link" } });
+      for (const file of init.body.getAll("files")) uploads.push(await file.text());
+      return jsonResponse(201, { data: { space: { id: "spc_one" }, claim: { key: "claim-key" }, next: { action: "done" } } });
+    };
+    const result = await run(["codex", "session-one", "--json", ...flags], { adapters, env, fetchImpl, log: () => {}, warn: () => {} });
+    return { result, uploaded: uploads.join("\n") };
+  };
+
+  const masked = await publish([]);
+  assert.equal(masked.result.redacted, 2);
+  assert.equal(masked.result.title, "Use API_KEY=[redacted]");
+  assert.equal(masked.uploaded.includes("abcdefgh1234"), false);
+  assert.equal(masked.uploaded.includes(secret), false);
+  assert.match(masked.uploaded, /deploy with \[redacted\]/);
+
+  const raw = await publish(["--no-redact", "--new-space"]);
+  assert.equal(raw.result.redacted, 0);
+  assert.equal(raw.uploaded.includes(secret), true);
+});
+
+test("a session picked from the list is confirmed before anything is uploaded", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-confirm-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root };
+  let requests = 0;
+  const fetchImpl = async () => { requests += 1; throw new Error("no request expected"); };
+  const prompts = { ...fakePrompts([1, false]) };
+  prompts.confirm = prompts.select;
+  const result = await run([], { adapters: [fakeAdapter()], env, fetchImpl, prompts, interactive: true, log: () => {}, write: () => {} });
+  assert.equal(result, null);
+  assert.equal(prompts.asked[1].message, "Publish this session?");
+  assert.equal(requests, 0);
+});
+
+test("publishes the sessions page, keeps a session's visibility on republish, and asks who can open a picked session", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-visibility-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root, SPACEFAST_TOKEN: "token" };
+  const stored = new Map();
+  let access = [];
+  const fetchImpl = async (url, init = {}) => {
+    const target = new URL(url);
+    const method = init.method || "GET";
+    if (target.pathname.endsWith("/files")) return jsonResponse(200, { data: { versionId: "ver_1", files: [...stored.keys()].map((file) => ({ path: file })) } });
+    if (target.pathname.endsWith("/files/links")) {
+      return jsonResponse(200, { data: { links: Object.fromEntries(target.searchParams.getAll("path").map((file) => [file, { url: `https://files.example/${file}` }])) } });
+    }
+    if (target.host === "files.example") return new Response(stored.get(target.pathname.slice(1)));
+    if (target.pathname.endsWith("/access") && method === "GET") return jsonResponse(200, { data: access });
+    if (target.pathname.endsWith("/access")) {
+      const entry = JSON.parse(init.body);
+      access.push({ id: `grt_${access.length + 1}`, subject: { audience: entry.audience }, capabilities: entry.capabilities, resources: { ...entry.resources, exclude: [] }, target: entry.target });
+      return jsonResponse(201, { data: {} });
+    }
+    if (target.pathname.includes("/access/")) {
+      access = access.filter((entry) => entry.id !== target.pathname.split("/").pop());
+      return jsonResponse(200, { data: {} });
+    }
+    if (target.pathname.endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/link" } });
+    for (const file of init.body.getAll("files")) stored.set(file.name, await file.text());
+    return jsonResponse(201, { data: { space: { id: "spc_x", title: "AI sessions", liveUrl: "https://sessions.example/" }, next: { action: "done" } } });
+  };
+  const options = { adapters: [fakeAdapter()], env, fetchImpl, log: () => {}, write: () => {}, warn: (message) => assert.fail(message) };
+  const listed = () => JSON.parse(stored.get("sessions/index.json")).sessions.map((session) => [session.path, session.visibility]);
+  const publicGrants = () => access.filter((entry) => entry.subject.audience === "public").map((entry) => entry.resources.include[0]);
+
+  const first = await run(["codex", "session-one", "--json", "--space", "spc_x", "--public"], options);
+  assert.equal(first.visibility, "public");
+  assert.match(first.url, /^https:\/\/sessions\.example\/sessions\/[0-9a-f]{8}-[0-9a-f-]{27}\/$/, "a random address, not the session ID");
+  const route = new URL(first.url).pathname.slice(1, -1);
+  assert.ok(stored.has("index.html") && stored.has("sessions/index.html"));
+  assert.deepEqual(listed(), [[route, "public"]]);
+  assert.equal(stored.get("sessions/public.json").includes("session-one"), false, "the public list does not give the session ID away");
+  assert.deepEqual(JSON.parse(stored.get("sessions/public.json")).sessions.length, 1);
+  assert.deepEqual(publicGrants(), [`/${route}`, "/"]);
+
+  const again = await run(["codex", "session-one", "--json", "--space", "spc_x"], options);
+  assert.equal(again.visibility, "public", "no flag keeps what the session had");
+  assert.equal(again.url, first.url, "and the session keeps its address");
+
+  const prompts = fakePrompts([1, "private"]);
+  const picked = await run(["--space", "spc_x"], { ...options, prompts, interactive: true });
+  assert.equal(prompts.asked[1].message, "Who can open this session?");
+  assert.equal(prompts.asked[1].initialValue, "public");
+  assert.equal(picked.visibility, "private");
+  assert.deepEqual(listed(), [[route, "private"]]);
+  assert.equal(picked.url, "https://sessions.example/__/link", "a private session opens with its share link");
+  assert.deepEqual(publicGrants(), [], "nothing public is left, so the sessions page is private again");
+
+  assert.deepEqual(prompts.asked[1].options.map((option) => option.value), ["private", "public"]);
+
+  await assert.rejects(run(["codex", "session-one", "--json", "--public"], { ...options, env: { ...env, SPACEFAST_TOKEN: "" } }), /--public needs you signed in/);
+
+  // A session published before addresses were random stays where its links point.
+  stored.set("sessions/index.json", JSON.stringify({ version: 1, sessions: [{ path: "sessions/session-one", title: "Old", visibility: "private" }] }));
+  stored.delete("sessions/session-one/index.html");
+  await run(["codex", "session-one", "--json", "--space", "spc_x"], options);
+  assert.ok(stored.has("sessions/session-one/index.html"), "published at the old address again");
+  assert.deepEqual(listed().find(([sessionPath]) => sessionPath === "sessions/session-one"), ["sessions/session-one", "private"]);
+});
+
+test("publishes nothing when the Space's session list cannot be read", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "push-session-unknown-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { PUSH_SESSION_CONFIG: path.join(root, "config.json"), SPACEFAST_HOME: root, SPACEFAST_TOKEN: "token" };
+  const uploads = [];
+  const fetchImpl = async (url, init = {}) => {
+    const target = new URL(url);
+    if (target.pathname.endsWith("/files")) return jsonResponse(500, { title: "Storage is down" });
+    if (target.pathname.endsWith("/access")) return jsonResponse(200, { data: [] });
+    if (target.pathname.endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/link" } });
+    uploads.push(init.body.getAll("files").map((file) => file.name));
+    return jsonResponse(201, { data: { space: { id: "spc_x", liveUrl: "https://sessions.example/" }, next: { action: "done" } } });
+  };
+  const options = { adapters: [fakeAdapter()], env, fetchImpl, log: () => {}, warn: () => {} };
+  // Without the list, the session's address and visibility there are unknown; guessing could duplicate it or flip who sees it.
+  for (const flags of [[], ["--private"], ["--public"]]) {
+    await assert.rejects(run(["codex", "session-one", "--json", "--space", "spc_x", ...flags], options), /address and who can open it are unknown\. Nothing was published/);
+  }
+  assert.equal(uploads.length, 0);
+});

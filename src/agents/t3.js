@@ -7,10 +7,22 @@ import { byRecent, cleanTitle, exists, safeJson, timestamp } from "./common.js";
 
 const require = createRequire(import.meta.url);
 
+let nodeDatabase;
+// Node 22 prints an ExperimentalWarning for node:sqlite into the picker; silence only that one.
+function loadNodeSqlite() {
+  if (nodeDatabase !== undefined) return nodeDatabase;
+  const emitWarning = process.emitWarning;
+  process.emitWarning = (warning, ...rest) => {
+    if (String(warning?.message ?? warning).startsWith("SQLite is an experimental feature")) return;
+    return emitWarning.call(process, warning, ...rest);
+  };
+  try { nodeDatabase = require("node:sqlite").DatabaseSync; } catch { nodeDatabase = null; } finally { process.emitWarning = emitWarning; }
+  return nodeDatabase;
+}
+
 // Keep older supported Node releases usable through the system SQLite CLI.
 function query(filePath, sql) {
-  let DatabaseSync;
-  try { ({ DatabaseSync } = require("node:sqlite")); } catch {}
+  const DatabaseSync = loadNodeSqlite();
   if (!DatabaseSync) {
     try {
       return JSON.parse(execFileSync("sqlite3", ["-readonly", "-json", filePath, sql], {

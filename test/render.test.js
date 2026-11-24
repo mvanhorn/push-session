@@ -109,3 +109,17 @@ test("labels tool calls with T3 Code's work-log vocabulary", () => {
   assert.equal(label({ name: "mcp__github__create_issue", input: {} }).label, "github: create issue");
   assert.equal(label({ name: "apply_patch", input: "*** Begin Patch\n*** Update File: a.js\n*** Update File: b.js\n" }).label, "Edited a.js +1 more");
 });
+
+test("splits long messages on lines and carries the open code fence to later fragments", () => {
+  const code = "const value = 1;\n".repeat(6_000);
+  const content = `Before\n\n\`\`\`js\n${code}\`\`\`\n\n${"After the code.\n".repeat(6_000)}`;
+  const bundle = renderSessionBundle(session, [{ role: "assistant", content }], { pageBytes: 32 * 1024 });
+  const events = bundle.files.slice(1).flatMap((file) => JSON.parse(file.content).events);
+  assert.equal(events.map((event) => event.payload.detail).join(""), content);
+  assert.ok(events.slice(0, -1).every((event) => event.payload.detail.endsWith("\n")));
+  const fences = events.map((event) => event.payload.data.wireFragment.fence);
+  assert.equal(fences[0], undefined);
+  assert.equal(fences[1], "```js");
+  assert.equal(fences.at(-1), undefined);
+  assert.ok(bundle.files.slice(1).every((file) => Buffer.byteLength(file.content) < 33 * 1024));
+});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { listFiles, listShareLinks, listSpaces, publishSession, revokeShareLink, sessionRoute } from "../src/spacefast.js";
+import { listSpaces, publishSession, sessionRoute } from "../src/spacefast.js";
 import { packageVersion } from "../src/version.js";
 
 test("builds a session route from one sanitized session ID", () => {
@@ -80,8 +80,8 @@ test("publishes paged files and creates a page-view-only Spacefast link", async 
 test("updates a selected space with bearer authentication", async () => {
   const requests = [];
   const fetchImpl = async (url, init) => {
+    if (String(url).endsWith("/access")) return jsonResponse(200, { data: [] });
     requests.push({ url: String(url), init });
-    if (init.method === "GET") return jsonResponse(200, { data: [] });
     if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/owned-link" } });
     return jsonResponse(201, {
       data: {
@@ -123,14 +123,20 @@ test("lists only owned Spaces and surfaces problem details", async () => {
 test("exchanges a claimed anonymous key and continues on the same space", async () => {
   const requests = [];
   let publishAttempts = 0;
+  const accessChecks = [];
+  let accessAfterClaim = [];
   const fetchImpl = async (url, init) => {
     const requestUrl = String(url);
+    // The spent claim key cannot list access; the credential it is exchanged for can.
+    if (requestUrl.endsWith("/access")) {
+      accessChecks.push(init.headers.authorization);
+      return init.headers.authorization === "Bearer continued-access" ? jsonResponse(200, { data: accessAfterClaim }) : jsonResponse(401, { code: "unauthorized" });
+    }
     requests.push({ url: requestUrl, init });
     if (requestUrl.endsWith("/claim/exchange")) {
       return jsonResponse(200, { data: { credential: { accessToken: "continued-access" } } });
     }
     if (requestUrl.endsWith("/share-links")) {
-      if (init.method === "GET") return jsonResponse(200, { data: [] });
       return jsonResponse(201, { data: { url: "https://sessions.example/__/continued-link" } });
     }
     publishAttempts += 1;
@@ -159,6 +165,29 @@ test("exchanges a claimed anonymous key and continues on the same space", async 
   assert.equal(requests[3].init.headers.authorization, "Bearer continued-access");
   assert.equal(result.space.id, "spc_claimed");
   assert.equal(result.credential.accessToken, "continued-access");
+  assert.deepEqual(accessChecks, ["Bearer old-claim-key", "Bearer continued-access"], "access is checked again with the exchanged credential");
+
+  // Whoever claimed the Space may have made it public: the retry then stops before uploading.
+  accessAfterClaim = [{ id: "grt_all", subject: { audience: "public" }, capabilities: ["page.view"], resources: { include: ["/**"], exclude: [] }, target: { kind: "live" } }];
+  publishAttempts = 0;
+  await assert.rejects(publishSession({ fetchImpl, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key" }), { message: /This Space is public/, stage: "claim_exchange" });
+  assert.equal(publishAttempts, 1, "only the first, refused attempt reached the publish endpoint");
+
+  // The same when the access cannot be read with the new credential. A Space it may not manage can be
+  // replaced; an outage is a failed publish to the same Space. Either way the credential is handed over.
+  for (const [status, stage] of [[403, "claim_exchange"], [500, undefined]]) {
+    const kept = [];
+    publishAttempts = 0;
+    const failing = (url, init) => (String(url).endsWith("/access") && init.headers.authorization === "Bearer continued-access"
+      ? jsonResponse(status, { title: "No" })
+      : fetchImpl(url, init));
+    await assert.rejects(
+      publishSession({ fetchImpl: failing, session: { id: "session-claimed" }, html: "ok", spaceId: "spc_claimed", claimToken: "old-claim-key", onCredential: (token) => kept.push(token) }),
+      (error) => error.status === status && error.stage === stage,
+    );
+    assert.equal(publishAttempts, 1, "no second publish");
+    assert.deepEqual(kept, ["continued-access"]);
+  }
 });
 
 test("switches giant sessions to manifest uploads and follows upload receipts", async () => {
@@ -239,134 +268,124 @@ test("accepts artifact-specific space and share names", async () => {
   assert.equal(sharePayload.name, "Claude artifact: One");
 });
 
-test("lists links, filters file prefixes, and revokes with the selected credential", async () => {
-  const requests = [];
-  const api = {
-    apiUrl: "https://api.example/", spaceId: "space/one", claimToken: "claim",
-    fetchImpl: async (url, init) => {
-      requests.push({ url: String(url), init });
-      if (init.method === "DELETE") return new Response(null, { status: 204 });
-      if (String(url).endsWith("/share-links")) return jsonResponse(200, { data: [{ id: "link/one" }] });
-      return jsonResponse(200, { data: { versionId: "v1", files: [
-        { path: "sessions/one/index.html" }, { path: "sessions/one/pages/0001.json" },
-        { path: "sessions/one-other/index.html" }, { path: "backup/sessions/one/index.html" },
-      ] } });
-    },
-  };
-  assert.deepEqual(await listShareLinks(api), [{ id: "link/one" }]);
-  assert.deepEqual((await listFiles({ ...api, prefix: "sessions/one/" })).files.map((file) => file.path), [
-    "sessions/one/index.html", "sessions/one/pages/0001.json",
-  ]);
-  await revokeShareLink({ ...api, linkId: "link/one" });
-  assert.equal(requests[1].url, "https://api.example/v1/spaces/space%2Fone/files?q=sessions%2Fone%2F");
-  assert.equal(requests[2].url, "https://api.example/v1/spaces/space%2Fone/share-links/link%2Fone");
-  assert.ok(requests.every((request) => request.init.headers.authorization === "Bearer claim"));
-  await assert.rejects(listShareLinks({ ...api, fetchImpl: async () => jsonResponse(200, { data: {} }) }), /unreadable share-link list/);
-  await assert.rejects(listFiles({ ...api, fetchImpl: async () => jsonResponse(403, { detail: "Forbidden" }) }), (error) => error.status === 403);
-});
-
-test("reuses only an active unexpired live view-only session link", async () => {
-  const valid = {
-    id: "reuse", url: "https://sessions.example/__/reuse", active: true, revokedAt: null,
-    landingPath: "/sessions/one", target: { kind: "live" }, capabilities: ["page.view"],
-    resources: { include: ["/sessions/one", "/sessions/one/**"], exclude: [] }, constraints: {},
-  };
-  const invalid = [
-    { active: false }, { revokedAt: "2020-01-01T00:00:00Z" },
-    { constraints: { expiresAt: "2020-01-01T00:00:00Z" } },
-    { constraints: { notBefore: "2999-01-01T00:00:00Z" } },
-    { constraints: { maxUses: 1 }, openCount: 1 }, { url: null },
-    { target: { kind: "version", versionId: "old" } }, { landingPath: "/sessions/other" },
-    { resources: { include: ["/**"] } }, { capabilities: ["page.view", "comments.write"] },
-    { resources: { include: valid.resources.include, exclude: ["/sessions/one/pages/**"] } },
-  ].map((overrides, index) => ({ ...valid, id: `invalid-${index}`, ...overrides }));
-  for (const includeValid of [true, false]) {
-    const requests = [];
-    const result = await publishSession({
-      session: { id: "one" }, html: "new", spaceId: "spc_one", accessToken: "token",
-      fetchImpl: async (url, init) => {
-        requests.push({ url: String(url), method: init.method });
-        if (init.method === "GET") return jsonResponse(200, { data: [...invalid, ...(includeValid ? [valid] : [])] });
-        if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/new" } });
-        return jsonResponse(201, { data: { space: { id: "spc_one" }, next: { action: "done" } } });
-      },
-    });
-    assert.equal(result.shareUrl, includeValid ? valid.url : "https://sessions.example/__/new");
-    assert.equal(requests.length, includeValid ? 2 : 3);
-  }
-});
-
-test("claim-token link lookup denial warns and continues publishing, but other errors stop", async () => {
-  for (const status of [401, 403, 500]) {
-    const warnings = [];
-    let created = 0;
-    const promise = publishSession({
-      session: { id: "one" }, html: "new", spaceId: "spc_one", claimToken: "claim",
-      warn: (message) => warnings.push(message),
-      fetchImpl: async (url, init) => {
-        if (init.method === "GET") return jsonResponse(status, { detail: "Lookup denied" });
-        if (String(url).endsWith("/share-links")) {
-          created += 1;
-          return jsonResponse(201, { data: { url: "https://sessions.example/__/new" } });
-        }
-        return jsonResponse(201, { data: { space: { id: "spc_one" }, next: { action: "done" } } });
-      },
-    });
-    if (status === 500) {
-      await assert.rejects(promise, /Lookup denied/);
-      assert.equal(created, 0);
-    } else {
-      assert.equal((await promise).shareUrl, "https://sessions.example/__/new");
-      assert.match(warnings[0], /Sign in with `sf login` to manage shared sessions/);
-    }
-  }
-});
-
-test("deletion-only publishes finalize the stalled version without creating links and reject unsafe paths", async () => {
-  const requests = [];
-  // Mirrors the live API: the publish asks for a poll, the version comes back
-  // "uploaded" with no next step, and only an explicit finalize activates it.
-  const fetchImpl = async (url, init) => {
-    requests.push({ url: String(url), init });
-    if (String(url).endsWith("/finalize")) return jsonResponse(200, { data: { id: "ver_del", status: "ready", fileCount: 2 } });
-    if (String(url).endsWith("/versions/ver_del")) return jsonResponse(200, { data: { id: "ver_del", status: "uploaded", fileCount: 0 } });
-    return jsonResponse(201, {
-      data: {
-        space: { id: "spc_one" },
-        version: { id: "ver_del", status: "uploaded" },
-        next: { action: "poll", url: "/v1/spaces/spc_one/versions/ver_del", retryAfter: 0 },
-      },
-    });
-  };
-  const deletePaths = ["sessions/one/index.html", "sessions/one/pages/0001.json"];
-  const result = await publishSession({ spaceId: "spc_one", accessToken: "token", deletePaths, fetchImpl });
-  assert.deepEqual(JSON.parse(requests[0].init.body.get("payload")), { spaceId: "spc_one", publishMode: "additive", deletePaths });
-  assert.equal(requests[0].init.body.getAll("files").length, 0);
-  assert.deepEqual(result.deletedPaths, deletePaths);
-  assert.equal(requests.length, 3);
-  assert.match(requests[2].url, /\/v1\/spaces\/spc_one\/versions\/ver_del\/finalize$/);
-  assert.equal(requests[2].init.method, "POST");
-  assert.deepEqual(JSON.parse(requests[2].init.body), { channel: "live" });
-  assert.equal(requests[2].init.headers.authorization, "Bearer token");
-  await assert.rejects(publishSession({ deletePaths, fetchImpl }), /existing Space/);
-  await assert.rejects(publishSession({ spaceId: "spc_one", deletePaths: ["sessions/one/../two/index.html"], fetchImpl }), /Invalid publish path/);
-  assert.equal(requests.length, 3);
-});
-
-test("deletion-only publishes fail loudly when finalize does not activate the version", async () => {
-  const fetchImpl = async (url) => {
-    if (String(url).endsWith("/finalize")) return jsonResponse(200, { data: { id: "ver_del", status: "failed" } });
-    return jsonResponse(201, { data: { space: { id: "spc_one" }, version: { id: "ver_del", status: "uploaded" } } });
-  };
-  await assert.rejects(
-    publishSession({ spaceId: "spc_one", accessToken: "token", deletePaths: ["sessions/one/index.html"], fetchImpl }),
-    /did not activate the file removal \(version status: failed\)/,
-  );
-});
-
 function jsonResponse(status, body) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
   });
 }
+
+test("retries transient publish failures with the same idempotency key", async () => {
+  const requests = [];
+  const failures = [
+    () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "retry-after": "0" } }),
+    () => new Response(JSON.stringify({ title: "Slow down" }), { status: 429, headers: { "retry-after": "0" } }),
+  ];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url: String(url), init });
+    if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { url: "https://sessions.example/__/link" } });
+    const failure = failures.shift();
+    if (failure) return failure();
+    return jsonResponse(201, { data: { space: { id: "spc_one" }, next: { action: "done" } } });
+  };
+  const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", accessToken: "token" });
+  assert.equal(result.shareUrl, "https://sessions.example/__/link");
+  const publishes = requests.filter((request) => request.url.includes("/v1/publish"));
+  assert.equal(publishes.length, 3);
+  assert.equal(new Set(publishes.map((request) => request.init.headers["idempotency-key"])).size, 1);
+
+  const denied = async () => jsonResponse(403, { title: "Forbidden" });
+  await assert.rejects(publishSession({ fetchImpl: denied, session: { id: "one" }, html: "ok" }), { status: 403 });
+  const hourLong = async () => new Response("{}", { status: 429, headers: { "retry-after": "3600" } });
+  await assert.rejects(publishSession({ fetchImpl: hourLong, session: { id: "one" }, html: "ok" }), { status: 429 });
+});
+
+test("republishing into a Space reuses the session's existing share link", async () => {
+  const link = (landingPath, overrides = {}) => ({
+    id: "grt_1",
+    subject: { audience: "link", linkId: `lnk_${landingPath.length}`, landingPath, url: `https://sessions.example/__${landingPath}` },
+    capabilities: ["page.view"],
+    resources: { include: [landingPath, `${landingPath}/**`], exclude: [] },
+    target: { kind: "live" },
+    ...overrides,
+  });
+  const publishWith = async (links, credential = { accessToken: "token" }) => {
+    const requests = [];
+    const fetchImpl = async (url, init = {}) => {
+      requests.push({ url: String(url), method: init.method || "GET" });
+      if (String(url).endsWith("/access")) return links ? jsonResponse(200, { data: links }) : jsonResponse(403, {});
+      if (String(url).endsWith("/share-links")) return jsonResponse(201, { data: { id: "lnk_new", url: "https://sessions.example/__/new" } });
+      return jsonResponse(201, { data: { space: { id: "spc_saved" }, next: { action: "done" } } });
+    };
+    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", ...credential });
+    return { result, created: requests.some((request) => request.url.endsWith("/share-links")) };
+  };
+
+  const reused = await publishWith([link("/sessions/other"), link("/sessions/one")]);
+  assert.equal(reused.result.shareUrl, "https://sessions.example/__/sessions/one");
+  assert.equal(reused.created, false);
+
+  const editorLink = link("/sessions/one", { capabilities: ["page.view", "comments.write"] });
+  const expiring = link("/sessions/one", { constraints: { expiresAt: "2030-01-01T00:00:00Z" } });
+  for (const links of [[link("/sessions/other")], [editorLink, expiring]]) {
+    const fresh = await publishWith(links);
+    assert.equal(fresh.result.shareUrl, "https://sessions.example/__/new");
+    assert.equal(fresh.created, true);
+  }
+
+  // An unread access list could hide a public grant, so a signed-in publish stops. Signed out there is none to hide.
+  await assert.rejects(publishWith(null), { status: 403 });
+  const signedOut = await publishWith(null, { claimToken: "claim" });
+  assert.equal(signedOut.result.shareUrl, "https://sessions.example/__/new");
+});
+
+test("public and private sessions adjust the Space's access instead of making a share link", async () => {
+  const session = ["/sessions/one", "/sessions/one/**"];
+  const index = ["/", "/index.html", "/sessions", "/sessions/index.html", "/sessions/public.json"];
+  const grant = (id, audience, include, subject = {}) => ({ id, subject: { audience, ...subject }, capabilities: ["page.view"], resources: { include, exclude: [] }, target: { kind: "live" } });
+  const publishWith = async (access, options) => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const target = new URL(url);
+      const method = init.method || "GET";
+      if (target.pathname.endsWith("/access") && method === "GET") return jsonResponse(200, { data: access });
+      if (target.pathname.includes("/access")) {
+        calls.push(method === "POST" ? `grant ${JSON.parse(init.body).audience} ${JSON.parse(init.body).resources.include[0]}` : `revoke ${target.pathname.split("/").pop()}`);
+        return jsonResponse(method === "POST" ? 201 : 200, { data: {} });
+      }
+      if (target.pathname.endsWith("/share-links")) { calls.push("link"); return jsonResponse(201, { data: { url: "https://sessions.example/__/new" } }); }
+      calls.push("upload");
+      return jsonResponse(201, { data: { space: { id: "spc_saved", liveUrl: "https://sessions.example/" }, next: { action: "done" } } });
+    };
+    const result = await publishSession({ fetchImpl, session: { id: "one" }, html: "ok", spaceId: "spc_saved", accessToken: "token", ...options });
+    return { result, calls };
+  };
+
+  const made = await publishWith([], { visibility: "public", publicIndex: true });
+  assert.deepEqual(made.calls, ["upload", "grant public /sessions/one", "grant public /"]);
+  assert.equal(made.result.shareUrl, "https://sessions.example/sessions/one/");
+  assert.equal(made.result.visibility, "public");
+
+  const existing = [grant("grt_link", "link", session, { landingPath: "/sessions/one", url: "https://sessions.example/__/old" }), grant("grt_public", "public", session), grant("grt_index", "public", index), grant("grt_other", "public", ["/sessions/two", "/sessions/two/**"])];
+  assert.deepEqual((await publishWith(existing, { visibility: "public", publicIndex: true })).calls, ["upload"], "already public");
+  const closed = await publishWith(existing, { visibility: "private", publicIndex: false });
+  assert.deepEqual(closed.calls, ["revoke grt_public", "revoke grt_index", "upload"], "public access ends before the new content is live; the link stays");
+  assert.equal(closed.result.shareUrl, "https://sessions.example/__/old");
+  const linked = await publishWith(existing, { visibility: "private" });
+  assert.deepEqual(linked.calls, ["revoke grt_public", "upload"], "the index grant is left alone when the index was not rebuilt");
+  assert.equal(linked.result.shareUrl, "https://sessions.example/__/old");
+
+  // A public Space opens every session, so a private publish stops before anything is uploaded.
+  const wholeSpace = [grant("grt_all", "public", ["/**"])];
+  await assert.rejects(publishWith(wholeSpace, { visibility: "private" }), /This Space is public/);
+  assert.equal((await publishWith(wholeSpace, { visibility: "public" })).result.publicSpace, true);
+  assert.equal((await publishWith([grant("grt_other", "public", ["/sessions/two/**"])], { visibility: "private" })).result.publicSpace, false);
+
+  // In a Space whose home page is its own, the sessions page is public under /sessions/ only.
+  const sessionsOnly = ["/sessions", "/sessions/index.html", "/sessions/public.json"];
+  assert.deepEqual((await publishWith([], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["upload", "grant public /sessions/one", "grant public /sessions"]);
+  assert.deepEqual((await publishWith([grant("grt_public", "public", session), grant("grt_index", "public", index)], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["revoke grt_index", "upload", "grant public /sessions"], "a grant on the home page is withdrawn");
+  assert.deepEqual((await publishWith([grant("grt_public", "public", session), grant("grt_index", "public", sessionsOnly)], { visibility: "public", publicIndex: true, rootIndex: false })).calls, ["upload"]);
+
+  await assert.rejects(publishSession({ fetchImpl: async () => { throw new Error("no request expected"); }, session: { id: "one" }, html: "ok", visibility: "public" }), /need you signed in/);
+});
