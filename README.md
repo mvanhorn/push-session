@@ -88,6 +88,32 @@ from the list asks who can open it before it is published.
 Options: `--pick-space`, `--space <id>`, `--new-space`, `--team <slug>`,
 `--limit <n>`, `--public`, `--private`, `--no-redact`, `--dry-run`, `--json`, and `--api-url <url>`.
 
+## Manage what you've shared
+
+`list` shows the sessions in your Space: the agent, the title, who can open
+each one, when it was last active, and the address that opens it.
+
+```bash
+npx push-session list
+npx push-session list --json
+npx push-session unshare <session-id|route|url>
+npx push-session unshare <session-id> --keep-files
+npx push-session unshare <session-id> --yes
+```
+
+`unshare` takes a session back. It ends every share link scoped to that session
+and its public access, removes its files from the live Space (transcript pages
+and recovered artifacts included), and takes it off the sessions page. It asks
+for confirmation first. Use `--yes` to skip the prompt, or `--json` for a
+non-interactive result. Without a terminal, one of those flags is required.
+`--keep-files` ends the links and public access but leaves the files, so the
+session stays on the list for your team as a private one.
+Both commands accept `--space <id>` to manage another Space once. A signed-out
+Space has to be claimed before it can be managed.
+
+File removal affects the live version. Earlier immutable versions, downloaded
+copies, and broader Space access are not removed by `unshare`.
+
 ## What the page shows
 
 A paginated, read-only transcript: your messages, the agent's replies in

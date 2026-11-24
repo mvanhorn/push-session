@@ -24,7 +24,19 @@ import {
   resolveApiUrl,
   selectPublishState,
 } from "./config.js";
-import { listSpaces, publishSession } from "./spacefast.js";
+import {
+  listSpaceAccess,
+  listSpaces,
+  openToEveryone,
+  publishSession,
+  readSpace,
+  readSpaceFiles,
+  revokeIndexAccess,
+  revokeSessionAccess,
+  sessionAccess,
+  sessionRoute,
+  updateSpaceFiles,
+} from "./spacefast.js";
 import { drawAgentLogos } from "./terminal-logos.js";
 import { runWeb } from "./web.js";
 import { packageVersion } from "./version.js";
@@ -46,6 +58,8 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
   const parsed = parseArgs(argv, env);
   if (parsed.options.help) return printHelp();
   if (parsed.options.version) return console.log(packageVersion);
+  if (["list", "unshare"].includes(parsed.agent)) return manageSessions(parsed, dependencies);
+  if (parsed.options.keepFiles || parsed.options.yes) throw new Error("--keep-files and --yes are only supported by unshare.");
   const log = dependencies.log || console.log;
   const prompts = dependencies.prompts || clack;
   const interactive = dependencies.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY && !parsed.options.json);
@@ -477,6 +491,177 @@ async function publishAnonymous(context) {
   return result;
 }
 
+const MANAGE_SIGN_IN_MESSAGE = "Sign in with `sf login` to manage shared sessions.";
+
+/** `list` shows what a Space has published; `unshare` takes one session back. */
+async function manageSessions(parsed, dependencies) {
+  const { options } = parsed;
+  const unshare = parsed.agent === "unshare";
+  if (unshare && !parsed.sessionId) throw new Error("Usage: push-session unshare <session-id|route|url> [--keep-files] [--yes]");
+  if (!unshare && (parsed.sessionId || options.keepFiles || options.yes)) throw new Error("Usage: push-session list [--json]");
+  if (options.newSpace || options.pickSpace || options.team || options.dryRun || options.visibility) {
+    throw new Error("list and unshare use an existing Space; --new-space, --pick-space, --team, --dry-run, --public and --private are not supported.");
+  }
+  const env = dependencies.env || process.env;
+  const log = dependencies.log || console.log;
+  const prompts = dependencies.prompts || clack;
+  const interactive = !options.json && (dependencies.interactive ?? Boolean(process.stdin.isTTY && process.stdout.isTTY));
+  if (unshare && !interactive && !options.yes && !options.json) {
+    throw new Error("Unsharing without a terminal requires --yes or --json.");
+  }
+  const config = loadConfig(env);
+  const apiUrl = resolveApiUrl(config, options);
+  const auth = await (dependencies.resolveAuth || resolveAuth)({ env, apiUrl, keyring: dependencies.keyring });
+  const savedAnonymous = apiUrl === resolveApiUrl(config, {}) ? config.space : null;
+  const savedOwned = ownedSpaceFor(config, apiUrl);
+  const space = options.space
+    ? [savedOwned, savedAnonymous].find((saved) => saved?.id === options.space) || { id: options.space }
+    : (auth && savedOwned) || savedAnonymous;
+  if (!space?.id) throw new Error("No remembered session Space. Publish a session first or pass --space <id>.");
+  // A signed-out Space answers to its own credential, not to an account it was never claimed into.
+  const signedOutSpace = savedAnonymous?.id === space.id ? savedAnonymous : null;
+  const accessToken = signedOutSpace?.accessToken || auth?.accessToken || signedOutSpace?.claimToken || null;
+  if (!accessToken) throw new Error(MANAGE_SIGN_IN_MESSAGE);
+  const api = { apiUrl, accessToken, fetchImpl: dependencies.fetchImpl };
+  const inSpace = { ...api, spaceId: space.id };
+  try {
+    // A Space named with --space is not one this machine remembers, so its title and address are read.
+    const [index, access, details] = await Promise.all([loadSessionIndex(api, space.id), listSpaceAccess(inSpace), space.liveUrl ? space : readSpace(inSpace)]);
+    const origin = originOf(details.liveUrl);
+    const visibilityOf = (entries, sessionPath) => (openToEveryone(entries, sessionPath) ? "public" : "private");
+    if (!unshare) {
+      const sessions = index.sessions
+        .map((entry) => {
+          const visibility = visibilityOf(access, entry.path);
+          const shareLinks = sessionAccess(access, entry.path).links;
+          return {
+            sessionId: entry.sessionId || entry.path.slice("sessions/".length),
+            title: entry.title || entry.path,
+            agent: entry.agent || null,
+            route: entry.path,
+            visibility,
+            // A public session opens at its own address; a private one through its share link.
+            url: visibility === "public" ? origin && `${origin}/${entry.path}/` : shareLinks[0]?.url || null,
+            shareLinks,
+            createdAt: entry.createdAt || null,
+            updatedAt: entry.updatedAt || entry.publishedAt || null,
+          };
+        })
+        .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+      const result = { spaceId: space.id, sessions };
+      if (options.json) log(JSON.stringify(result));
+      else log(formatSessionList({ title: details.title || space.id, sessions }, { columns: dependencies.columns || process.stdout.columns }));
+      return result;
+    }
+
+    const basePath = resolveSharedRoute(parsed.sessionId, { sessions: index.sessions, access, origin });
+    const entry = index.sessions.find((session) => session.path === basePath);
+    const own = sessionAccess(access, basePath);
+    const deletePaths = options.keepFiles ? [] : (await readSpaceFiles({ ...inSpace, select: () => [] })).paths.filter((file) => file.startsWith(`${basePath}/`));
+    if (!entry && !own.links.length && !own.publicGrants.length && !deletePaths.length) throw new Error(`No published session found at ${basePath}.`);
+    const ends = [
+      own.links.length > 0 && `${own.links.length} share link${own.links.length === 1 ? "" : "s"}`,
+      own.publicGrants.length > 0 && "public access",
+    ].filter(Boolean).join(" and ") || "no links";
+    const files = options.keepFiles ? "keeps its files for your team" : `deletes ${deletePaths.length} file${deletePaths.length === 1 ? "" : "s"}`;
+    if (interactive && !options.yes) {
+      const confirmed = await prompts.confirm({
+        message: `Unshare "${entry?.title || basePath}"? This ends ${ends} and ${files}.`,
+        initialValue: false,
+      });
+      if (prompts.isCancel(confirmed) || !confirmed) {
+        log("Nothing unshared.");
+        return { cancelled: true };
+      }
+    }
+    const revoked = { linkIds: [], publicGrants: 0 };
+    // What is left once the session's own grants are gone. A wider one, such as a public Space, is
+    // not this command's to end, so files that are kept stay open through it, and that is said.
+    const remaining = access.filter((item) => !own.publicGrants.includes(item));
+    const stillPublic = options.keepFiles && openToEveryone(remaining, basePath);
+    try {
+      await revokeSessionAccess(inSpace, own, revoked);
+      // The session leaves the Space's list, or stays on it when its files are kept.
+      const sessions = index.sessions
+        .filter((session) => session.path !== basePath || options.keepFiles)
+        .map((session) => (session.path === basePath ? { ...session, visibility: stillPublic ? "public" : "private" } : session));
+      if (!sessions.some((session) => visibilityOf(remaining, session.path) === "public")) await revokeIndexAccess(inSpace, remaining);
+      await updateSpaceFiles({ ...inSpace, deletePaths, files: sessionIndexFiles(sessions, { spaceTitle: details.title, root: !index.rootTaken }) });
+    } catch (error) {
+      // The route, not what was typed: a link that was just ended no longer leads to the session.
+      const again = ["push-session unshare", basePath, options.space && `--space ${options.space}`, options.apiUrl && `--api-url ${options.apiUrl}`, options.keepFiles && "--keep-files"].filter(Boolean).join(" ");
+      error.message = `${error.message} Unshare stopped after ending ${revoked.linkIds.length} of ${own.links.length} links; file removal is not confirmed. Run \`${again}\` to finish.`;
+      throw error;
+    }
+    const result = { spaceId: space.id, route: basePath, revokedLinkIds: revoked.linkIds, revokedPublicAccess: revoked.publicGrants > 0, deletedPaths: deletePaths, keptFiles: options.keepFiles, stillPublic };
+    if (options.json) log(JSON.stringify(result));
+    else {
+      log(`Unshared ${entry?.title ? `"${entry.title}"` : basePath}: ended ${ends}, ${options.keepFiles ? "kept its files" : `deleted ${deletePaths.length} file${deletePaths.length === 1 ? "" : "s"}`}.`);
+      if (stillPublic) log("Its files are still open to everyone, because the Space itself is public.");
+    }
+    return result;
+  } catch (error) {
+    // Until it is claimed, a signed-out Space can be published to and nothing else.
+    if (signedOutSpace && !signedOutSpace.accessToken && [401, 403, 404].includes(error.status)) {
+      error.message = `This Space has not been claimed, so its sessions cannot be managed yet. Claim it${signedOutSpace.claimUrl ? ` at ${signedOutSpace.claimUrl}` : ""}, then run this again. ${error.message}`;
+    } else if (!auth && [401, 403].includes(error.status)) error.message = `${MANAGE_SIGN_IN_MESSAGE} ${error.message}`;
+    throw error;
+  }
+}
+
+// A session ID, a sessions/<id> route, or a link to the session, as the folder it is published in.
+function resolveSharedRoute(value, { sessions, access, origin }) {
+  const invalid = () => new Error("Expected a session ID, sessions/<id> route, or session share URL.");
+  if ([".", ".."].includes(value)) throw invalid();
+  let route = value;
+  if (/^https?:\/\//i.test(value)) {
+    const url = new URL(value);
+    const linked = access.find((entry) => entry.subject?.audience === "link" && entry.subject.url === url.href);
+    if (linked) route = linked.subject.landingPath;
+    else {
+      if (url.origin !== origin) throw new Error("That URL does not belong to the selected Space. Use a session ID or route.");
+      route = decodeURIComponent(url.pathname);
+    }
+  } else if (!value.includes("/")) {
+    // New sessions live at a random address, so the ID is looked up in the Space's list first.
+    const listed = sessions.find((session) => session.sessionId === value || session.path === `sessions/${value}`);
+    route = listed?.path || sessionRoute({ id: value });
+  }
+  const match = String(route).match(/^\/?(sessions\/([a-zA-Z0-9._-]+))(?:\/index\.html|\/)?$/);
+  if (!match || [".", ".."].includes(match[2])) throw invalid();
+  return match[1];
+}
+
+function originOf(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** The `list` output: one row per session with its agent, who can open it and its age, then its link. */
+export function formatSessionList({ title, sessions }, { columns } = {}) {
+  if (sessions.length === 0) return "No published sessions in this Space.";
+  const bar = pc.gray("│");
+  // Mark, title, access and age share the row; the title gets what the terminal has left, within reason.
+  const width = Math.max(20, Math.min(56, (columns || 80) - 30));
+  const clip = (text) => {
+    const flat = String(text).replace(/\s+/g, " ").trim();
+    return flat.length > width ? `${flat.slice(0, width - 1)}…` : flat.padEnd(width);
+  };
+  const lines = [bar, `${pc.green("◇")}  ${pc.bold(title)} ${pc.dim(`· ${sessions.length} session${sessions.length === 1 ? "" : "s"}`)}`, bar];
+  for (const session of sessions) {
+    const access = session.visibility === "public" ? pc.yellow("Public ") : "Private";
+    const age = relativeDate(Date.parse(session.updatedAt)) || "";
+    lines.push(
+      `${bar}  ${agentMark({ id: session.agent })}  ${clip(session.title)}  ${access}  ${pc.dim(age)}`.trimEnd(),
+      `${bar}      ${pc.dim(session.url || "No share link: only your team can open it")}`,
+    );
+  }
+  return lines.join("\n");
+}
+
 const ACCESS_LABELS = {
   private: "Private, opens with the link",
   public: "Public, open to everyone",
@@ -684,6 +869,8 @@ Usage
   npx push-session <agent>               Pick from one agent
   npx push-session <agent> <session-id>  Share that one, no questions
   npx push-session web                   Pick sessions in a page on this machine
+  npx push-session list                  Show what you have published
+  npx push-session unshare <id|route|url>  End a session's links and remove its files
   npx push-session artifacts <list|export|publish>
 
 Agents
@@ -709,6 +896,8 @@ Options
   --private      Only your team and people with the share link (the default)
   --public       Anyone can open the session, no link needed
   --no-redact    Publish keys, tokens and passwords as written instead of masking them
+  --keep-files   With unshare: end the links and public access, keep the files for your team
+  --yes          With unshare: do not ask first
   --dry-run      Render everything, upload nothing
   --json         Print one machine-readable result
   --api-url      Override the Spacefast API origin

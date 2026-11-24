@@ -449,6 +449,84 @@ function totalFileBytes(files) {
   return files.reduce((total, file) => total + file.size, 0);
 }
 
+/** A Space's own details: its title and the address it is served at. */
+export async function readSpace({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId }) {
+  const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/v1/spaces/${encodeURIComponent(spaceId)}`, { headers: requestHeaders({ bearerToken: accessToken }) });
+  const body = await responseJson(response);
+  if (!response.ok) throw apiError(response, body);
+  return body?.data || {};
+}
+
+/** Whether anyone at all can open a session: through its own public grant or a wider one, such as a public Space. */
+export function openToEveryone(entries, basePath) {
+  const root = `/${basePath}`;
+  return entries.some((entry) => entry.subject?.audience === "public"
+    && (entry.resources?.include || []).some((pattern) => covers(pattern, root))
+    && !(entry.resources?.exclude || []).some((pattern) => covers(pattern, root)));
+}
+
+/** A session's own ways in: the share links and public grants that cover nothing outside its folder. */
+export function sessionAccess(entries, basePath) {
+  const root = `/${basePath}`;
+  const within = (entry) => entry.resources?.include?.length > 0
+    && entry.resources.include.every((value) => value === root || value.startsWith(`${root}/`));
+  return {
+    links: entries.filter((entry) => entry.subject?.audience === "link" && entry.subject.linkId && within(entry))
+      .map((entry) => ({ id: entry.subject.linkId, url: entry.subject.url || null })),
+    publicGrants: entries.filter((entry) => entry.subject?.audience === "public" && within(entry)),
+  };
+}
+
+/** Ends a session's share links and public access. `done` collects what was ended, as it is ended. */
+export async function revokeSessionAccess({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId }, { links, publicGrants }, done = { linkIds: [], publicGrants: 0 }) {
+  const api = { apiUrl: apiUrl.replace(/\/$/, ""), accessToken, fetchImpl, spaceId };
+  for (const link of links) {
+    const response = await fetchImpl(`${api.apiUrl}/v1/spaces/${encodeURIComponent(spaceId)}/share-links/${encodeURIComponent(link.id)}`, {
+      method: "DELETE",
+      headers: requestHeaders({ bearerToken: accessToken }),
+    });
+    if (!response.ok && response.status !== 404) throw apiError(response, await responseJson(response));
+    done.linkIds.push(link.id);
+  }
+  for (const grant of publicGrants) {
+    await revokeSpaceAccess(api, grant.id);
+    done.publicGrants += 1;
+  }
+  return done;
+}
+
+/** Closes the sessions page to the public again, once no public session is left for it to list. */
+export async function revokeIndexAccess({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId }, entries) {
+  const api = { apiUrl: apiUrl.replace(/\/$/, ""), accessToken, fetchImpl, spaceId };
+  const isIndex = (entry) => entry.subject?.audience === "public"
+    && [true, false].some((root) => String(entry.resources?.include) === String(indexResources(root)));
+  for (const entry of entries.filter(isIndex)) await revokeSpaceAccess(api, entry.id);
+}
+
+/**
+ * Writes files to a Space's live version and removes others, in one publish. There is always
+ * something to write here (the session list), so the publish settles like any other.
+ */
+export async function updateSpaceFiles({ apiUrl = DEFAULT_API_URL, accessToken, fetchImpl = globalThis.fetch, spaceId, deletePaths = [], files }) {
+  const origin = apiUrl.replace(/\/$/, "");
+  const prepared = prepareFiles({ files });
+  if (prepared.length === 0) throw new Error("No files were given to write to the Space.");
+  const removed = deletePaths.map(normalizeFilePath);
+  const request = inlinePublishRequest({ spaceId, publishMode: "additive", ...(removed.length > 0 && { deletePaths: removed }) }, prepared);
+  const response = await fetchImpl(`${origin}/v1/publish?wait=1`, {
+    method: "POST",
+    headers: {
+      ...requestHeaders({ bearerToken: accessToken, idempotencyKey: `push-session-${randomUUID()}`, idempotencyPrincipal: randomBytes(32).toString("hex") }),
+      ...request.headers,
+    },
+    body: request.body,
+  });
+  const initial = await responseJson(response);
+  if (!response.ok) throw apiError(response, initial);
+  await settlePublish({ initial, files: prepared, apiUrl: origin, bearerToken: accessToken, fetchImpl });
+  return { deletedPaths: removed };
+}
+
 /** Lists the Spaces a credential can publish into, newest first. */
 export async function listSpaces({ apiUrl = DEFAULT_API_URL, accessToken, query, limit = 100, fetchImpl = globalThis.fetch }) {
   const url = new URL("/v1/spaces", apiUrl);
