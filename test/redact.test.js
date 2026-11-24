@@ -100,6 +100,8 @@ test("masks a quoted assignment up to its closing quote, and a whole Authorizati
     ['{"Authorization":"Negotiate YIIZaAYGKwYBBQUCoIIZ","enabled":true}', '{"Authorization":"Negotiate [redacted]","enabled":true}'],
     ['{"Authorization": "Digest username=\\"u\\", response=\\"6629fae4\\"", "retries": 2}', '{"Authorization": "Digest [redacted]", "retries": 2}'],
     ["curl -H 'Authorization: Digest username=\"u\", response=\"6629fae4\"' https://example.com", "curl -H 'Authorization: Digest [redacted]' https://example.com"],
+    // A value with no other end is masked up to the quote after its last backslash.
+    ['{"cmd":"export API_KEY=\\"abcdefgh\\\\\\" && echo ok"}', '{"cmd":"export API_KEY=\\"[redacted]\\" && echo ok"}'],
     // Inside a JSON string a quote escaped within the value does not end it.
     ['{"cmd":"API_TOKEN=\\"long enough \\\\\\"secret suffix\\\\\\" tail\\" deploy"}', '{"cmd":"API_TOKEN=\\"[redacted]\\" deploy"}'],
   ];

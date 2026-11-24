@@ -27,6 +27,9 @@ const PATTERNS = [
   // within the value is written \\\". Each alternative starts differently, so a value that never
   // closes is given up on at once instead of being split every possible way.
   /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\(?:\\[\s\S]|[^\\])|\\(?!\\|\2)[\s\S]|[^\\]){8,}(?=\\\2)/g,
+  // A value that reading finds no end for, such as one whose last character is a backslash, is
+  // masked up to the first quote after it instead of being left as it is.
+  /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=\\(["']))(?!\[redacted\])(?:\\\\|\\(?!\\|\2)[\s\S]|[^\\]){8,}?(?=\\\2)/g,
   /(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*=)(?!\[redacted\])[^\s"'\\,;]{8,}/g,
   // Quoted "apiKey": "value" pairs, including JSON nested inside a string. The value must be one
   // word with a digit or symbol, so interface copy such as "password": "Password" is left alone.
