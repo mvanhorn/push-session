@@ -13,9 +13,12 @@ const PATTERNS = [
   // Authorization headers: the scheme stays, the credential goes. In a header any length is a
   // credential; on its own, "Bearer" or "Basic" needs a long token after it to count.
   /(\bAuthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)(?!\[redacted\])[^\s"'\\,;]+/gi,
-  // Schemes whose credential is several fields: everything to the end of the line goes, unless the
-  // whole of it is the mask already.
-  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\][ \t]*(?:\n|$))[^\n]+/gi,
+  // Schemes whose credential is several fields. In a quoted value ("Authorization": "Digest ...") or
+  // a quoted header ('Authorization: Digest ...') everything up to the closing quote goes, so what
+  // follows it stays. Otherwise everything to the end of the line goes, unless it is the mask already.
+  /(\bAuthorization["']\s*:\s*(["'])(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi,
+  /((["'])(?:Proxy-)?Authorization\s*:\s*(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\]\2)(?:\\[\s\S]|(?!\2)[^\\\n])+(?=\2)/gi,
+  /(\bAuthorization["']?\s*[:=]\s*["']?(?:Digest|Negotiate|NTLM)\s+)(?!\[redacted\](?:["']|[ \t]*(?:\n|$)))[^\n]+/gi,
   /(\b(?:Bearer|Basic)\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{20,}/g,
   // Environment-style NAME_KEY=value assignments; the name stays readable. A quoted value is masked
   // up to its closing quote, spaces and escaped quotes included, so none of it is left behind.

@@ -96,6 +96,10 @@ test("masks a quoted assignment up to its closing quote, and a whole Authorizati
     ['Authorization: Digest username="u", response="6629fae49393a05397450978507c4ef1"', "Authorization: Digest [redacted]"],
     // A value that only starts with the mask still has a credential after it.
     ['Authorization: Digest [redacted], response="6629fae49393a05397450978507c4ef1"\nnext', "Authorization: Digest [redacted]\nnext"],
+    // A quoted value or header ends at its quote: the fields and text after it are kept.
+    ['{"Authorization":"Negotiate YIIZaAYGKwYBBQUCoIIZ","enabled":true}', '{"Authorization":"Negotiate [redacted]","enabled":true}'],
+    ['{"Authorization": "Digest username=\\"u\\", response=\\"6629fae4\\"", "retries": 2}', '{"Authorization": "Digest [redacted]", "retries": 2}'],
+    ["curl -H 'Authorization: Digest username=\"u\", response=\"6629fae4\"' https://example.com", "curl -H 'Authorization: Digest [redacted]' https://example.com"],
     // Inside a JSON string a quote escaped within the value does not end it.
     ['{"cmd":"API_TOKEN=\\"long enough \\\\\\"secret suffix\\\\\\" tail\\" deploy"}', '{"cmd":"API_TOKEN=\\"[redacted]\\" deploy"}'],
   ];
