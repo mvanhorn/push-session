@@ -92,12 +92,16 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
   }
   const loaded = await selection.adapter.load(selection.session);
   if (loaded.length === 0) throw new Error("That session has nothing to share yet.");
-  let { value: messages, count: redacted } = parsed.options.redact ? redactDeep(loaded) : { value: loaded, count: 0 };
+  let { value: messages, count: redacted, kinds: redactionCounts } = parsed.options.redact ? redactDeep(loaded) : { value: loaded, count: 0, kinds: {} };
+  const countKinds = (found) => {
+    redacted += found.count;
+    for (const [kind, number] of Object.entries(found.kinds)) redactionCounts[kind] = (redactionCounts[kind] || 0) + number;
+  };
   if (parsed.options.redact && selection.session.title) {
     // The title is usually the first prompt, so it can carry the same secrets as the transcript.
     const title = redactText(selection.session.title);
     selection.session = { ...selection.session, title: title.text };
-    redacted += title.count;
+    countKinds(title);
   }
 
   let artifacts = [];
@@ -124,7 +128,7 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
     // Recovered artifact and Site sources are published too, so they get the same masking.
     const sources = redactDeep({ artifacts, sites });
     ({ artifacts, sites } = sources.value);
-    redacted += sources.count;
+    countKinds(sources);
   }
   const renderBundle = (basePath) => renderSessionWithArtifacts(selection.session, messages, artifacts, { sites, ...(basePath && { basePath }) });
   const bundle = renderBundle();
@@ -143,11 +147,12 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
       siteVersions: bundle.siteVersions,
       recoveredSiteVersions: bundle.recoveredSiteVersions,
       redacted,
+      redactionCounts,
       route: bundle.entryPath,
     };
     if (parsed.options.json) log(JSON.stringify(result));
     else {
-      prompts.note(`${result.messages} transcript entries\n${result.pages} JSON page${result.pages === 1 ? "" : "s"}\n${result.artifacts} Claude artifact${result.artifacts === 1 ? "" : "s"}\n${result.sites} ChatGPT Site${result.sites === 1 ? "" : "s"}\n${result.bytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact)}\n${result.route}`, "Ready to publish");
+      prompts.note(`${result.messages} transcript entries\n${result.pages} JSON page${result.pages === 1 ? "" : "s"}\n${result.artifacts} Claude artifact${result.artifacts === 1 ? "" : "s"}\n${result.sites} ChatGPT Site${result.sites === 1 ? "" : "s"}\n${result.bytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact, redactionCounts)}\n${result.route}`, "Ready to publish");
       prompts.outro("Dry run. Nothing left your machine.");
     }
     return result;
@@ -187,9 +192,9 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
   // A session picked from the list gets one look before it leaves the machine; an explicit ID asks nothing.
   const review = interactive && !parsed.sessionId;
   if (review) {
-    prompts.note(`${messages.length} transcript entries · ${bundle.totalBytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact)}`, selection.session.title);
+    prompts.note(`${messages.length} transcript entries · ${bundle.totalBytes.toLocaleString()} bytes\n${redactionLine(redacted, parsed.options.redact, redactionCounts)}`, selection.session.title);
   } else if (redacted > 0) {
-    warn(redactionLine(redacted, true));
+    warn(redactionLine(redacted, true, redactionCounts));
   }
   // Signed in, the review is the question of who may open the session; signed out there is one answer.
   if (review && !auth) {
@@ -213,6 +218,7 @@ export async function run(argv = process.argv.slice(2), dependencies = {}) {
     siteVersions: bundle.siteVersions,
     recoveredSiteVersions: bundle.recoveredSiteVersions,
     redacted,
+    redactionCounts,
     visibility: result.visibility,
     versionUrl: result.versionUrl,
     spaceId: result.space.id,
@@ -846,10 +852,11 @@ function formatDate(value, now = Date.now()) {
   return `${day} (${days === 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`})`;
 }
 
-function redactionLine(count, enabled) {
+function redactionLine(count, enabled, kinds = {}) {
   if (!enabled) return "Secret masking is off (--no-redact)";
   if (count === 0) return "No secrets found to mask";
-  return `Masked ${count} secret${count === 1 ? "" : "s"} (keys, tokens, passwords). --no-redact publishes them as written.`;
+  const breakdown = Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([kind, number]) => `${kind}: ${number}`).join(", ");
+  return `Masked ${count} secret${count === 1 ? "" : "s"} (${breakdown || "keys, tokens, passwords"}). --no-redact publishes them as written.`;
 }
 
 function printHelp() {
