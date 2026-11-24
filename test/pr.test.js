@@ -298,7 +298,10 @@ function cliFixture(context, options = {}) {
         confirm: async (prompt) => { confirmations.push(prompt); return options.consent; },
       },
       fetchImpl: async (url) => {
-        if (String(url).endsWith("/share-links")) return jsonResponse({ data: { url: `https://sessions.example/share-${publishes}` } });
+        const pathname = new URL(url).pathname;
+        if (pathname === "/v1/spaces/spc_pr/access") return jsonResponse({ data: [] });
+        if (pathname === "/v1/spaces/spc_pr/share-links") return jsonResponse({ data: { url: `https://sessions.example/share-${publishes}` } });
+        assert.equal(pathname, "/v1/publish");
         publishes += 1;
         return jsonResponse({ data: {
           space: { id: "spc_pr", liveUrl: "https://landing.example/" },
